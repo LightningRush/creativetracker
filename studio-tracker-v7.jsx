@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from "react";
+import { UserButton } from "@clerk/clerk-react";
 
 // ─── PALETTE ─────────────────────────────────────────────────────────────────
 const C = {
@@ -68,7 +69,7 @@ const fmt       = (d) => d ? new Date(d).toLocaleDateString("en-US", { month: "s
 const daysUntil = (d) => d ? Math.ceil((new Date(d) - new Date()) / 86400000) : null;
 
 async function load() { try { const r = await window.storage.get("st_v10"); return r ? JSON.parse(r.value) : SEED; } catch { return SEED; } }
-async function save(p) { try { await window.storage.set("st_v10", JSON.stringify(p)); } catch {} }
+async function save(p) { await window.storage.set("st_v10", JSON.stringify(p)); }
 
 // ─── SELECT SETS DATA ────────────────────────────────────────────────────────
 const CUSTOMERS = [
@@ -88,7 +89,7 @@ const SS_STATUS = [
 ];
 const ssStatusOf = (id) => SS_STATUS.find(s => s.id === id) || SS_STATUS[0];
 async function loadSS() { try { const r = await window.storage.get("ss_v1"); return r ? JSON.parse(r.value) : []; } catch { return []; } }
-async function saveSS(s) { try { await window.storage.set("ss_v1", JSON.stringify(s)); } catch {} }
+async function saveSS(s) { await window.storage.set("ss_v1", JSON.stringify(s)); }
 
 // ─── HEATMAP CARD ────────────────────────────────────────────────────────────
 function HeatmapCard({ projects }) {
@@ -890,49 +891,93 @@ export default function StudioTracker() {
   const [boardMode,      setBoardMode]      = useState("products"); // "products" | "presentations"
   const [drawer,         setDrawer]         = useState(null);
   const [toast,          setToast]          = useState(null);
+  const flash = (msg) => { setToast(msg); setTimeout(() => setToast(null), 2400); };
 
   useEffect(() => {
-    Promise.all([load(), loadSS()]).then(([p, s]) => {
-      setProjects(p); setSets(s); setLoading(false);
-    });
+    let active = true;
+
+    (async () => {
+      try {
+        if (window.storage.migrate) await window.storage.migrate();
+        const [p, s] = await Promise.all([load(), loadSS()]);
+        if (!active) return;
+        setProjects(p);
+        setSets(s);
+      } catch (e) {
+        console.error("Failed to load team data:", e);
+        if (active) flash("Could not load team board — check Supabase settings");
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+
+    const applyRemote = (setter, raw) => {
+      try {
+        setter(JSON.parse(raw));
+      } catch {
+        /* ignore malformed payloads */
+      }
+    };
+
+    const unsubProjects =
+      window.storage.subscribe?.("st_v10", (value) => applyRemote(setProjects, value)) ??
+      (() => {});
+
+    const unsubSets =
+      window.storage.subscribe?.("ss_v1", (value) => applyRemote(setSets, value)) ??
+      (() => {});
+
+    return () => {
+      active = false;
+      unsubProjects();
+      unsubSets();
+    };
   }, []);
-  const persist = useCallback((u) => { setProjects(u); save(u); }, []);
-  const flash   = (msg) => { setToast(msg); setTimeout(() => setToast(null), 2400); };
+
+  const saveProjects = useCallback(async (next, msg) => {
+    setProjects(next);
+    try {
+      await save(next);
+      if (msg) flash(msg);
+    } catch (e) {
+      console.error(e);
+      flash("Could not save — team may not see this change");
+    }
+  }, []);
 
   const handleAssign = useCallback((id, name) => {
-    setProjects(prev => {
-      const proj = prev.find(p => p.id === id);
-      if (!proj || proj.assignee === name) return prev;
-      const next = prev.map(p => p.id === id ? { ...p, assignee: name } : p);
-      save(next); flash(`"${proj.title}" → ${name}`); return next;
-    });
-  }, []);
+    const proj = projects.find(p => p.id === id);
+    if (!proj || proj.assignee === name) return;
+    const next = projects.map(p => p.id === id ? { ...p, assignee: name } : p);
+    saveProjects(next, `"${proj.title}" → ${name}`);
+  }, [projects, saveProjects]);
 
   const handleReorder = useCallback((id, newStage, beforeId) => {
-    setProjects(prev => {
-      const proj = prev.find(p => p.id === id);
-      if (!proj) return prev;
-      let next = prev.filter(p => p.id !== id);
-      const updated = { ...proj, stage: newStage };
-      if (beforeId) { const i = next.findIndex(p => p.id === beforeId); next.splice(i >= 0 ? i : next.length, 0, updated); }
-      else { const idxs = next.map((p, i) => p.stage === newStage ? i : -1).filter(i => i >= 0); next.splice(idxs.length ? idxs[idxs.length - 1] + 1 : next.length, 0, updated); }
-      save(next);
-      if (proj.stage !== newStage) flash(`Moved to ${stageOf(newStage).label}`);
-      return next;
-    });
-  }, []);
+    const proj = projects.find(p => p.id === id);
+    if (!proj) return;
+    let next = projects.filter(p => p.id !== id);
+    const updated = { ...proj, stage: newStage };
+    if (beforeId) { const i = next.findIndex(p => p.id === beforeId); next.splice(i >= 0 ? i : next.length, 0, updated); }
+    else { const idxs = next.map((p, i) => p.stage === newStage ? i : -1).filter(i => i >= 0); next.splice(idxs.length ? idxs[idxs.length - 1] + 1 : next.length, 0, updated); }
+    const msg = proj.stage !== newStage ? `Moved to ${stageOf(newStage).label}` : null;
+    saveProjects(next, msg);
+  }, [projects, saveProjects]);
 
   const handleQuickAdd = useCallback((stageId, title) => {
     const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignee: assigneeFilter || TEAM[0].name, season: "SS26", cpmId: "", dueDate: "", notes: "", synced: false, lastSync: "Never" };
-    setProjects(prev => { const next = [...prev, p]; save(next); return next; });
-    flash(`Added "${title}"`);
-  }, [categoryFilter, assigneeFilter, boardMode]);
+    saveProjects([...projects, p], `Added "${title}"`);
+  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode]);
 
   const handleSave = (data) => {
-    setProjects(prev => { const exists = prev.some(p => p.id === data.id); const next = exists ? prev.map(p => p.id === data.id ? data : p) : [data, ...prev]; save(next); return next; });
+    const exists = projects.some(p => p.id === data.id);
+    const next = exists ? projects.map(p => p.id === data.id ? data : p) : [data, ...projects];
+    saveProjects(next);
     setDrawer(null);
   };
-  const handleDelete = (id) => { setProjects(prev => { const next = prev.filter(p => p.id !== id); save(next); return next; }); setDrawer(null); };
+  const handleDelete = (id) => {
+    saveProjects(projects.filter(p => p.id !== id));
+    setDrawer(null);
+  };
 
   const presentationProjects = projects.filter(p => p.projectType === "presentation");
   const catPool = projects.filter(p => {
@@ -1012,6 +1057,14 @@ export default function StudioTracker() {
         }
         .brand-name { font-size: 16px; font-weight: 700; color: #F0F0F6; }
         .brand-tag { font-size: 11px; color: #56566A; }
+        .sync-pill {
+          font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+          padding: 3px 8px; border-radius: 100px; margin-left: 4px;
+          background: rgba(52,211,153,0.12); color: #34D399; border: 1px solid rgba(52,211,153,0.3);
+        }
+        .sync-pill.local {
+          background: rgba(251,191,36,0.12); color: #FBBF24; border-color: rgba(251,191,36,0.35);
+        }
         .header-right { display: flex; align-items: center; gap: 10px; }
         .search-input {
           width: 200px; background: #14141A; border: 1px solid #2A2A36;
@@ -1378,6 +1431,9 @@ export default function StudioTracker() {
           <div className="brand-mark">◈</div>
           <span className="brand-name">Studio</span>
           <span className="brand-tag">· Centric PPM</span>
+          <span className={`sync-pill ${window.storage?.mode === "shared" ? "" : "local"}`}>
+            {window.storage?.mode === "shared" ? "Team board" : "This device only"}
+          </span>
         </div>
         <div className="header-right">
           {/* Page nav */}
@@ -1394,6 +1450,12 @@ export default function StudioTracker() {
             </div>
             <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New</button>
           </>}
+          <UserButton
+            afterSignOutUrl="/"
+            appearance={{
+              elements: { avatarBox: { width: 32, height: 32 } },
+            }}
+          />
         </div>
       </header>
 
