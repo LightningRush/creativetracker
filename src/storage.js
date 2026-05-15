@@ -51,6 +51,15 @@ function createSupabaseStorage(url, anonKey) {
   }
 
   async function set(key, value) {
+    const isEmpty = !value || value === "[]" || value === "null";
+    if (isEmpty) {
+      const { data } = await supabase.from(TABLE).select("value").eq("key", key).maybeSingle();
+      if (data?.value && data.value !== "[]") {
+        console.warn("[storage] Blocked empty save — team data already exists for", key);
+        return;
+      }
+    }
+
     localStorage.setItem(key, value);
 
     const { error } = await supabase.from(TABLE).upsert(
@@ -101,7 +110,7 @@ function createSupabaseStorage(url, anonKey) {
       } catch {
         /* ignore */
       }
-    }, 5000);
+    }, 3000);
 
     return () => {
       clearInterval(poll);

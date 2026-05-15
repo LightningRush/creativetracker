@@ -927,10 +927,24 @@ export default function StudioTracker() {
       window.storage.subscribe?.("ss_v1", (value) => applyRemote(setSets, value)) ??
       (() => {});
 
+    const reloadFromCloud = () => {
+      Promise.all([load(), loadSS()]).then(([p, s]) => {
+        if (!active) return;
+        setProjects(p);
+        setSets(s);
+      }).catch(() => {});
+    };
+
+    window.addEventListener("focus", reloadFromCloud);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") reloadFromCloud();
+    });
+
     return () => {
       active = false;
       unsubProjects();
       unsubSets();
+      window.removeEventListener("focus", reloadFromCloud);
     };
   }, []);
 
