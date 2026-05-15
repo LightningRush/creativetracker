@@ -20,7 +20,9 @@ function createLocalStorage() {
 }
 
 function createSupabaseStorage(url, anonKey) {
-  const supabase = createClient(url, anonKey);
+  const supabase = createClient(url, anonKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
   const TABLE = "tracker_state";
   const KEYS = [PROJECTS_KEY, SELECT_SETS_KEY];
 
@@ -31,19 +33,40 @@ function createSupabaseStorage(url, anonKey) {
       .eq("key", key)
       .maybeSingle();
 
-    if (error) throw error;
-    return data ? { value: data.value } : null;
+    if (error) {
+      console.error("[storage] Supabase read failed:", error.message);
+      const local = localStorage.getItem(key);
+      if (local) return { value: local, source: "local-fallback" };
+      throw error;
+    }
+
+    if (data?.value) {
+      localStorage.setItem(key, data.value);
+      return { value: data.value, source: "cloud" };
+    }
+
+    const local = localStorage.getItem(key);
+    if (local) return { value: local, source: "local-fallback" };
+    return null;
   }
 
   async function set(key, value) {
+    localStorage.setItem(key, value);
+
     const { error } = await supabase.from(TABLE).upsert(
       { key, value, updated_at: new Date().toISOString() },
       { onConflict: "key" }
     );
-    if (error) throw error;
+
+    if (error) {
+      console.error("[storage] Supabase save failed:", error.message, error);
+      throw new Error(error.message || "Could not save to team board");
+    }
   }
 
   function subscribe(key, onValue) {
+    let last = localStorage.getItem(key);
+
     const channel = supabase
       .channel(`tracker_state:${key}`)
       .on(
@@ -57,9 +80,12 @@ function createSupabaseStorage(url, anonKey) {
         async () => {
           try {
             const row = await get(key);
-            if (row?.value != null) onValue(row.value);
+            if (row?.value != null && row.value !== last) {
+              last = row.value;
+              onValue(row.value);
+            }
           } catch {
-            /* ignore poll/subscribe errors */
+            /* ignore */
           }
         }
       )
@@ -68,7 +94,10 @@ function createSupabaseStorage(url, anonKey) {
     const poll = setInterval(async () => {
       try {
         const row = await get(key);
-        if (row?.value != null) onValue(row.value);
+        if (row?.value != null && row.value !== last) {
+          last = row.value;
+          onValue(row.value);
+        }
       } catch {
         /* ignore */
       }
@@ -80,27 +109,29 @@ function createSupabaseStorage(url, anonKey) {
     };
   }
 
-  /** Upload browser-only data to Supabase when the cloud row is empty. */
   async function migrate() {
     for (const key of KEYS) {
-      const local = localStorage.getItem(key);
-      if (!local || local === "[]") continue;
+      try {
+        const local = localStorage.getItem(key);
+        if (!local || local === "[]") continue;
 
-      const remote = await get(key);
-      const remoteEmpty = !remote?.value || remote.value === "[]";
-      if (!remoteEmpty) continue;
+        const remote = await get(key);
+        const remoteEmpty = !remote?.value || remote.value === "[]";
+        if (!remoteEmpty) continue;
 
-      await set(key, local);
+        await set(key, local);
+      } catch (e) {
+        console.warn("[storage] migrate skipped for", key, e);
+      }
     }
   }
 
   return { get, set, subscribe, migrate, mode: "shared" };
 }
 
-/** Initialize window.storage — shared DB when Supabase env vars exist, else localStorage. */
 export function initStorage() {
-  const url = import.meta.env.VITE_SUPABASE_URL;
-  const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  const url = import.meta.env.VITE_SUPABASE_URL?.trim();
+  const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
 
   const storage =
     url && anonKey ? createSupabaseStorage(url, anonKey) : createLocalStorage();
