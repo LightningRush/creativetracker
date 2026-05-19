@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from "react";
 import { UserButton } from "@clerk/clerk-react";
+import { useAppRole } from "./src/useAppRole.js";
+
+const defaultAssignee = (teamProfile) =>
+  (teamProfile && TEAM.some(t => t.name === teamProfile) ? teamProfile : TEAM[0].name);
 
 // ─── PALETTE ─────────────────────────────────────────────────────────────────
 const C = {
@@ -55,6 +59,7 @@ const TEAM = [
   { name: "Anthony C.", color: "#34D399" },
   { name: "Flavia N.",  color: "#C084FC" },
   { name: "Angel S.",   color: "#60A5FA" },
+  { name: "Rafa C.",    color: "#8B7FFF" },
 ];
 const teamColor = (name) => TEAM.find(t => t.name === name)?.color || "#9494B0";
 
@@ -117,15 +122,15 @@ function HeatmapCard({ projects }) {
 }
 
 // ─── BOARD CARD ──────────────────────────────────────────────────────────────
-function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen }) {
+function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, canEdit = true }) {
   const days    = daysUntil(project.dueDate);
   const overdue = days !== null && days < 0;
   const dueSoon = days !== null && days >= 0 && days <= 14;
   const cc      = catColor(project.category);
   return (
     <div
-      className={`card ${isDragging ? "card-dragging" : ""} ${isDropTarget ? "card-drop-target" : ""}`}
-      onPointerDown={(e) => onPointerDown(e, project)}
+      className={`card ${isDragging ? "card-dragging" : ""} ${isDropTarget ? "card-drop-target" : ""} ${!canEdit ? "card-view-only" : ""}`}
+      onPointerDown={canEdit ? (e) => onPointerDown(e, project) : undefined}
       onClick={() => { if (!isDragging) onOpen(project); }}
       data-card-id={project.id}
       style={{ "--cc": cc }}
@@ -153,7 +158,6 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen })
                 {overdue ? `${Math.abs(days)}d late` : fmt(project.dueDate)}
               </span>
             )}
-            {!project.synced && <span className="unsync-dot" title="Not synced" />}
           </div>
         </div>
       </div>
@@ -162,7 +166,8 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen })
 }
 
 // ─── QUICK ADD ───────────────────────────────────────────────────────────────
-function QuickAdd({ stageId, onAdd }) {
+function QuickAdd({ stageId, onAdd, canEdit = true }) {
+  if (!canEdit) return null;
   const [active, setActive] = useState(false);
   const [value,  setValue]  = useState("");
   const inputRef = useRef(null);
@@ -184,7 +189,7 @@ function QuickAdd({ stageId, onAdd }) {
 }
 
 // ─── BOARD ───────────────────────────────────────────────────────────────────
-function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STAGES }) {
+function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STAGES, canEdit = true }) {
   const [drag,      _setDrag]  = useState(null);
   const [hover,     _setHover] = useState(null);
   const [collapsed, setCollapsed] = useState(new Set(["archived"]));
@@ -301,6 +306,7 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
   }, []); // ← empty: register once, read refs for fresh values
 
   const handleCardPointerDown = (e, project) => {
+    if (!canEdit) return;
     if (e.target.closest("button, a, input, select")) return;
     if (e.pointerType === "mouse" && e.button !== 0) return;
     const rect = e.currentTarget.getBoundingClientRect();
@@ -319,6 +325,7 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
   };
 
   const handleTeamPointerDown = (e, member) => {
+    if (!canEdit) return;
     e.preventDefault(); e.stopPropagation();
     isDraggingRef.current = true;
     const nd = { kind: "team", name: member.name, color: member.color, x: e.clientX, y: e.clientY };
@@ -335,7 +342,7 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
       <div className="team-strip">
         <div className="team-strip-top">
           <span className="strip-label">Team</span>
-          <span className="strip-hint">{isDC ? "Drop on teammate to reassign" : isDT ? "Drop onto any project card" : "Drag cards to move · drag teammates to reassign"}</span>
+          <span className="strip-hint">{!canEdit ? "View only — click a card for details" : isDC ? "Drop on teammate to reassign" : isDT ? "Drop onto any project card" : "Drag cards to move · drag teammates to reassign"}</span>
         </div>
         <div className="team-row">
           {TEAM.map(t => {
@@ -343,8 +350,8 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
             const isBeingDragged = isDT && drag.name === t.name;
             return (
               <div key={t.name} data-assignee={t.name}
-                onPointerDown={(e) => handleTeamPointerDown(e, t)}
-                className={`team-chip ${isChipDrop ? "chip-on" : ""} ${isBeingDragged ? "chip-lifting" : ""}`}
+                onPointerDown={canEdit ? (e) => handleTeamPointerDown(e, t) : undefined}
+                className={`team-chip ${isChipDrop ? "chip-on" : ""} ${isBeingDragged ? "chip-lifting" : ""} ${!canEdit ? "team-chip-view" : ""}`}
                 style={{ "--tc": t.color }}
               >
                 <span className="av av-sm" style={{ background: t.color }}>{initials(t.name)}</span>
@@ -394,12 +401,12 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
                     return (
                       <div key={p.id}>
                         {isBeforeMarker && <div className="drop-marker" />}
-                        <BoardCard project={p} isDragging={isDC && drag.project.id === p.id} isDropTarget={isTeamDropTarget} onPointerDown={handleCardPointerDown} onOpen={onOpen} />
+                        <BoardCard project={p} isDragging={isDC && drag.project.id === p.id} isDropTarget={isTeamDropTarget} onPointerDown={handleCardPointerDown} onOpen={onOpen} canEdit={canEdit} />
                       </div>
                     );
                   })}
                   {isHov && !hover.beforeId && items.length > 0 && <div className="drop-marker" />}
-                  <QuickAdd stageId={stage.id} onAdd={onQuickAdd} />
+                  <QuickAdd stageId={stage.id} onAdd={onQuickAdd} canEdit={canEdit} />
                 </div>
               )}
             </div>
@@ -441,7 +448,6 @@ function ListView({ projects, onOpen }) {
                 <div className="list-meta">
                   <span className="cat-chip sm" style={{ background: `${cc}22`, color: cc, border: `1px solid ${cc}44` }}>{catLabel(p.category)}</span>
                   <span className="sep">·</span><span>{p.season}</span>
-                  {p.cpmId && <><span className="sep">·</span><span className="mono">{p.cpmId}</span></>}
                 </div>
               </div>
               <div className="list-stage-pill">
@@ -581,11 +587,11 @@ function CalendarView({ projects, onOpen }) {
 }
 
 // ─── DRAWER ──────────────────────────────────────────────────────────────────
-function Drawer({ project, isNew, onSave, onClose, onDelete, presentations }) {
+function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, readOnly = false, defaultAssigneeName = TEAM[0].name }) {
   const [form, setForm] = useState(project || {
     title: "", category: "apparel", stage: "concept", projectType: "product",
-    assignee: TEAM[0].name, season: "SS26",
-    cpmId: "", startDate: "", dueDate: "", notes: "", synced: false, lastSync: "Never", presentationId: "", sourcePresId: "",
+    assignee: defaultAssigneeName, season: "SS26",
+    startDate: "", dueDate: "", notes: "", presentationId: "", sourcePresId: "",
   });
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -599,49 +605,45 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations }) {
         <div className="drawer-cat-bar" style={{ background: catColor(form.category) }} />
         <div className="drawer-inner">
           <div className="drawer-head">
-            <span className="eyebrow">{isNew ? "New" : "Edit"} {isPresentation ? "Presentation" : "Project"}</span>
+            <span className="eyebrow">{readOnly ? "View" : isNew ? "New" : "Edit"} {isPresentation ? "Presentation" : "Project"}</span>
             <button onClick={onClose} className="close-btn">✕</button>
           </div>
 
-          {isNew && (
+          {isNew && !readOnly && (
             <div className="ss-type-toggle" style={{ marginBottom: 16 }}>
               <button onClick={() => { set("projectType","product"); set("stage","concept"); }} className={`ss-type-btn ${!isPresentation ? "active" : ""}`}>Product</button>
               <button onClick={() => { set("projectType","presentation"); set("stage","brief"); }} className={`ss-type-btn ${isPresentation ? "active" : ""}`}>Presentation</button>
             </div>
           )}
 
-          <input value={form.title} onChange={e => set("title", e.target.value)}
+          <input value={form.title} onChange={e => set("title", e.target.value)} readOnly={readOnly}
             placeholder={isPresentation ? "e.g. Costco FW26 Home Goods Pitch" : "Product name"}
-            autoFocus={isNew} className="drawer-title" />
+            autoFocus={isNew && !readOnly} className="drawer-title" />
           <div className="field-grid">
             <Field label="Stage">
-              <Select value={form.stage} onChange={e => set("stage", e.target.value)}>
+              <Select value={form.stage} onChange={e => set("stage", e.target.value)} disabled={readOnly}>
                 {stageOptions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
               </Select>
             </Field>
-            <Field label="Category"><Select value={form.category} onChange={e => set("category", e.target.value)}>{CATEGORIES.filter(c => c.id !== "all").map(c => <option key={c.id} value={c.id}>{c.label}</option>)}</Select></Field>
+            <Field label="Category"><Select value={form.category} onChange={e => set("category", e.target.value)} disabled={readOnly}>{CATEGORIES.filter(c => c.id !== "all").map(c => <option key={c.id} value={c.id}>{c.label}</option>)}</Select></Field>
             {isPresentation && (
-              <Field label="Customer"><Select value={form.customer || ""} onChange={e => set("customer", e.target.value)}><option value="">— Select —</option>{CUSTOMERS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</Select></Field>
+              <Field label="Customer"><Select value={form.customer || ""} onChange={e => set("customer", e.target.value)} disabled={readOnly}><option value="">— Select —</option>{CUSTOMERS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</Select></Field>
             )}
-            <Field label="Season"><Select value={form.season} onChange={e => set("season", e.target.value)}>{SEASONS.map(s => <option key={s}>{s}</option>)}</Select></Field>
-            <Field label="Assignee"><Select value={form.assignee} onChange={e => set("assignee", e.target.value)}>{TEAM.map(t => <option key={t.name}>{t.name}</option>)}</Select></Field>
-            <Field label="Start Date"><Input type="date" value={form.startDate} onChange={e => set("startDate", e.target.value)} /></Field>
-            <Field label="End / Due Date"><Input type="date" value={form.dueDate} onChange={e => set("dueDate", e.target.value)} /></Field>
-            <Field label="Centric CPM ID"><Input value={form.cpmId} onChange={e => set("cpmId", e.target.value)} placeholder="CPM-XXXXX" /></Field>
+            <Field label="Season"><Select value={form.season} onChange={e => set("season", e.target.value)} disabled={readOnly}>{SEASONS.map(s => <option key={s}>{s}</option>)}</Select></Field>
+            <Field label="Assignee"><Select value={form.assignee} onChange={e => set("assignee", e.target.value)} disabled={readOnly}>{TEAM.map(t => <option key={t.name}>{t.name}</option>)}</Select></Field>
+            <Field label="Start Date"><Input type="date" value={form.startDate} onChange={e => set("startDate", e.target.value)} disabled={readOnly} /></Field>
+            <Field label="End / Due Date"><Input type="date" value={form.dueDate} onChange={e => set("dueDate", e.target.value)} disabled={readOnly} /></Field>
             {!isPresentation && presentations && presentations.length > 0 && (
               <Field label="Source Presentation" full>
-                <Select value={form.sourcePresId || ""} onChange={e => set("sourcePresId", e.target.value)}>
+                <Select value={form.sourcePresId || ""} onChange={e => set("sourcePresId", e.target.value)} disabled={readOnly}>
                   <option value="">None — design-led</option>
                   {presentations.map(p => <option key={p.id} value={p.id}>{p.title}</option>)}
                 </Select>
               </Field>
             )}
-            <Field label="Status Notes" full><Textarea rows={4} value={form.notes} onChange={e => set("notes", e.target.value)} placeholder="Latest updates, blockers, next steps..." /></Field>
+            <Field label="Status Notes" full><Textarea rows={4} value={form.notes} onChange={e => set("notes", e.target.value)} disabled={readOnly} placeholder="Latest updates, blockers, next steps..." /></Field>
           </div>
-          <label className="sync-toggle">
-            <input type="checkbox" checked={form.synced} onChange={e => set("synced", e.target.checked)} />
-            Synced with Centric PPM
-          </label>
+          {!readOnly ? (
           <div className="drawer-actions">
             <button onClick={() => onSave({ ...form, id: form.id || `p${Date.now()}` })} disabled={!form.title.trim()} className="btn-primary">
               {isNew ? "Create project" : "Save changes"}
@@ -655,6 +657,11 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations }) {
                 : <button onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
             )}
           </div>
+          ) : (
+            <div className="drawer-actions">
+              <button onClick={onClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+            </div>
+          )}
         </div>
       </div>
     </>
@@ -667,7 +674,7 @@ const Textarea = (p) => <textarea {...p} className="ui-input ui-textarea" />;
 const Select   = (p) => <select   {...p} className="ui-input ui-select" />;
 
 // ─── SELECT SET DRAWER ───────────────────────────────────────────────────────
-function SSDrawer({ set, isNew, onSave, onClose, onDelete }) {
+function SSDrawer({ set, isNew, onSave, onClose, onDelete, readOnly = false }) {
   const [form, setForm] = useState(set || {
     name: "", customerId: CUSTOMERS[0].id, link: "",
     category: "apparel", season: "SS26", status: "active", notes: "",
@@ -684,17 +691,17 @@ function SSDrawer({ set, isNew, onSave, onClose, onDelete }) {
         <div className="drawer-cat-bar" style={{ background: cust?.color || "#8B7FFF" }} />
         <div className="drawer-inner">
           <div className="drawer-head">
-            <span className="eyebrow">{isNew ? "New Select Set" : "Edit Select Set"}</span>
+            <span className="eyebrow">{readOnly ? "View Select Set" : isNew ? "New Select Set" : "Edit Select Set"}</span>
             <button onClick={onClose} className="close-btn">✕</button>
           </div>
-          <input value={form.name} onChange={e => s("name", e.target.value)}
+          <input value={form.name} onChange={e => s("name", e.target.value)} readOnly={readOnly}
             placeholder="e.g. Costco Hydration"
-            autoFocus={isNew} className="drawer-title" />
+            autoFocus={isNew && !readOnly} className="drawer-title" />
           <div className="field-grid">
             <Field label="Customer" full>
               <div className="ss-customer-picker">
                 {CUSTOMERS.map(c => (
-                  <button key={c.id} onClick={() => s("customerId", c.id)}
+                  <button key={c.id} onClick={() => !readOnly && s("customerId", c.id)} disabled={readOnly}
                     className={`ss-cust-btn ${form.customerId === c.id ? "ss-cust-active" : ""}`}
                     style={{ "--cc": c.color }}>
                     {c.name}
@@ -702,24 +709,24 @@ function SSDrawer({ set, isNew, onSave, onClose, onDelete }) {
                 ))}
               </div>
             </Field>
-            <Field label="Centric Link" full>
-              <input value={form.link} onChange={e => s("link", e.target.value)}
-                placeholder="Paste Centric select set URL…" className="ui-input" />
+            <Field label="Link" full>
+              <input value={form.link} onChange={e => s("link", e.target.value)} readOnly={readOnly}
+                placeholder="Paste select set URL…" className="ui-input" />
             </Field>
             <Field label="Category">
-              <Select value={form.category} onChange={e => s("category", e.target.value)}>
+              <Select value={form.category} onChange={e => s("category", e.target.value)} disabled={readOnly}>
                 {CATEGORIES.filter(c => c.id !== "all").map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
               </Select>
             </Field>
             <Field label="Season">
-              <Select value={form.season} onChange={e => s("season", e.target.value)}>
+              <Select value={form.season} onChange={e => s("season", e.target.value)} disabled={readOnly}>
                 {SEASONS.map(ss => <option key={ss}>{ss}</option>)}
               </Select>
             </Field>
             <Field label="Status" full>
               <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
                 {SS_STATUS.map(st => (
-                  <button key={st.id} onClick={() => s("status", st.id)}
+                  <button key={st.id} onClick={() => !readOnly && s("status", st.id)} disabled={readOnly}
                     className={`ss-status-btn ${form.status === st.id ? "ss-status-active" : ""}`}>
                     <span className="ss-dot" style={{ background: st.dot }} />{st.label}
                   </button>
@@ -727,10 +734,11 @@ function SSDrawer({ set, isNew, onSave, onClose, onDelete }) {
               </div>
             </Field>
             <Field label="Notes" full>
-              <Textarea rows={3} value={form.notes} onChange={e => s("notes", e.target.value)}
+              <Textarea rows={3} value={form.notes} onChange={e => s("notes", e.target.value)} disabled={readOnly}
                 placeholder="Any context, deadlines, or instructions…" />
             </Field>
           </div>
+          {!readOnly ? (
           <div className="drawer-actions">
             <button onClick={() => onSave({ ...form, id: form.id || `ss${Date.now()}` })}
               disabled={!form.name.trim() || !form.customerId} className="btn-primary">
@@ -745,6 +753,11 @@ function SSDrawer({ set, isNew, onSave, onClose, onDelete }) {
                 : <button onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
             )}
           </div>
+          ) : (
+            <div className="drawer-actions">
+              <button onClick={onClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+            </div>
+          )}
         </div>
       </div>
     </>
@@ -752,7 +765,7 @@ function SSDrawer({ set, isNew, onSave, onClose, onDelete }) {
 }
 
 // ─── SELECT SETS PAGE ─────────────────────────────────────────────────────────
-function SelectSetsPage({ sets, projects, onSave, onDelete }) {
+function SelectSetsPage({ sets, projects, onSave, onDelete, canEdit = true }) {
   const [custFilter, setCustFilter] = useState("all");
   const [search, setSearch]         = useState("");
   const [drawer, setDrawer]         = useState(null);
@@ -786,7 +799,7 @@ function SelectSetsPage({ sets, projects, onSave, onDelete }) {
         <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
           <input value={search} onChange={e => setSearch(e.target.value)}
             placeholder="Search sets…" className="ss-search" />
-          <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New Set</button>
+          {canEdit && <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New Set</button>}
         </div>
       </div>
 
@@ -815,8 +828,8 @@ function SelectSetsPage({ sets, projects, onSave, onDelete }) {
                   <span className="ss-cust-name">{cust.name}</span>
                   <span className="ss-cust-count">{custSets.length}</span>
                 </div>
-                <button onClick={() => setDrawer({ isNew: true, prefill: { customerId: cust.id } })}
-                  className="ss-add-btn">+ Add Set</button>
+                {canEdit && <button onClick={() => setDrawer({ isNew: true, prefill: { customerId: cust.id } })}
+                  className="ss-add-btn">+ Add Set</button>}
               </div>
               {custSets.length === 0 ? (
                 <div className="ss-empty">No select sets yet — add one above</div>
@@ -841,9 +854,9 @@ function SelectSetsPage({ sets, projects, onSave, onDelete }) {
                           </div>
                           <div style={{ display:"flex", gap:6, flexShrink:0 }}>
                             {set.link
-                              ? <a href={set.link} target="_blank" rel="noopener noreferrer" className="ss-open-btn">Open in Centric ↗</a>
+                              ? <a href={set.link} target="_blank" rel="noopener noreferrer" className="ss-open-btn">Open link ↗</a>
                               : <span className="ss-no-link">No link</span>}
-                            <button onClick={() => setDrawer({ isNew: false, set })} className="ss-edit-btn">Edit</button>
+                            <button onClick={() => setDrawer({ isNew: false, set })} className="ss-edit-btn">{canEdit ? "Edit" : "View"}</button>
                           </div>
                         </div>
                         {set.notes && <div className="ss-card-notes">{set.notes}</div>}
@@ -859,14 +872,15 @@ function SelectSetsPage({ sets, projects, onSave, onDelete }) {
           <div className="ss-zero">
             <div className="ss-zero-icon">◈</div>
             <div className="ss-zero-title">No select sets yet</div>
-            <div className="ss-zero-sub">Add your first set and link it to Centric</div>
-            <button onClick={() => setDrawer({ isNew: true })} className="btn-new" style={{ marginTop:16 }}>+ New Set</button>
+            <div className="ss-zero-sub">Add your first set and optional link</div>
+            {canEdit && <button onClick={() => setDrawer({ isNew: true })} className="btn-new" style={{ marginTop:16 }}>+ New Set</button>}
           </div>
         )}
       </div>
 
       {drawer && (
         <SSDrawer
+          readOnly={!canEdit}
           set={drawer.set || (drawer.prefill ? { ...drawer.prefill } : undefined)}
           isNew={drawer.isNew}
           onSave={(data) => { onSave(data); setDrawer(null); }}
@@ -880,6 +894,7 @@ function SelectSetsPage({ sets, projects, onSave, onDelete }) {
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function StudioTracker() {
+  const { canEdit, isViewer, teamProfile } = useAppRole();
   const [projects,       setProjects]       = useState([]);
   const [sets,           setSets]           = useState([]);
   const [loading,        setLoading]        = useState(true);
@@ -960,6 +975,7 @@ export default function StudioTracker() {
   }, []);
 
   const handleAssign = useCallback((id, name) => {
+    if (!canEdit) return;
     const proj = projects.find(p => p.id === id);
     if (!proj || proj.assignee === name) return;
     const next = projects.map(p => p.id === id ? { ...p, assignee: name } : p);
@@ -967,6 +983,7 @@ export default function StudioTracker() {
   }, [projects, saveProjects]);
 
   const handleReorder = useCallback((id, newStage, beforeId) => {
+    if (!canEdit) return;
     const proj = projects.find(p => p.id === id);
     if (!proj) return;
     let next = projects.filter(p => p.id !== id);
@@ -978,17 +995,20 @@ export default function StudioTracker() {
   }, [projects, saveProjects]);
 
   const handleQuickAdd = useCallback((stageId, title) => {
-    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignee: assigneeFilter || TEAM[0].name, season: "SS26", cpmId: "", dueDate: "", notes: "", synced: false, lastSync: "Never" };
+    if (!canEdit) return;
+    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignee: assigneeFilter || defaultAssignee(teamProfile), season: "SS26", dueDate: "", notes: "" };
     saveProjects([...projects, p], `Added "${title}"`);
-  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode]);
+  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, teamProfile, canEdit]);
 
   const handleSave = (data) => {
+    if (!canEdit) return;
     const exists = projects.some(p => p.id === data.id);
     const next = exists ? projects.map(p => p.id === data.id ? data : p) : [data, ...projects];
     saveProjects(next);
     setDrawer(null);
   };
   const handleDelete = (id) => {
+    if (!canEdit) return;
     saveProjects(projects.filter(p => p.id !== id));
     setDrawer(null);
   };
@@ -997,7 +1017,7 @@ export default function StudioTracker() {
   const catPool = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const asnOk  = !assigneeFilter || p.assignee === assigneeFilter;
-    const txtOk  = !search || p.title.toLowerCase().includes(search.toLowerCase()) || p.cpmId?.toLowerCase().includes(search.toLowerCase());
+    const txtOk  = !search || p.title.toLowerCase().includes(search.toLowerCase());
     return typeOk && asnOk && txtOk && p.stage !== "archived";
   });
   const catCounts = CATEGORIES.reduce((a, c) => {
@@ -1008,7 +1028,7 @@ export default function StudioTracker() {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const catOk  = categoryFilter === "all" || p.category === categoryFilter;
     const asnOk  = !assigneeFilter || p.assignee === assigneeFilter;
-    const txtOk  = !search || p.title.toLowerCase().includes(search.toLowerCase()) || p.cpmId?.toLowerCase().includes(search.toLowerCase());
+    const txtOk  = !search || p.title.toLowerCase().includes(search.toLowerCase());
     return typeOk && catOk && asnOk && txtOk;
   });
   const activeStages  = boardMode === "presentations" ? PRES_STAGES : STAGES;
@@ -1020,6 +1040,7 @@ export default function StudioTracker() {
   const overdueCount  = visibleNonArchived.filter(p => { const d = daysUntil(p.dueDate); return d !== null && d < 0; }).length;
 
   const handleSSave = (data) => {
+    if (!canEdit) return;
     setSets(prev => {
       const exists = prev.some(s => s.id === data.id);
       const next = exists ? prev.map(s => s.id === data.id ? data : s) : [data, ...prev];
@@ -1027,6 +1048,7 @@ export default function StudioTracker() {
     });
   };
   const handleSDelete = (id) => {
+    if (!canEdit) return;
     setSets(prev => { const next = prev.filter(s => s.id !== id); saveSS(next); return next; });
   };
 
@@ -1076,10 +1098,13 @@ export default function StudioTracker() {
           padding: 3px 8px; border-radius: 100px; margin-left: 4px;
           background: rgba(52,211,153,0.12); color: #34D399; border: 1px solid rgba(52,211,153,0.3);
         }
+        .sync-pill.viewer { background: rgba(96,165,250,0.12); color: #60A5FA; border-color: rgba(96,165,250,0.35); }
         .sync-pill.local {
           background: rgba(251,191,36,0.12); color: #FBBF24; border-color: rgba(251,191,36,0.35);
         }
         .header-right { display: flex; align-items: center; gap: 10px; }
+        .header-profile { display: flex; align-items: center; gap: 8px; padding: 4px 10px 4px 4px; border-radius: 20px; background: #1C1C24; border: 1px solid #2A2A36; }
+        .header-profile-name { font-size: 12px; font-weight: 500; color: #F0F0F6; }
         .search-input {
           width: 200px; background: #14141A; border: 1px solid #2A2A36;
           border-radius: 8px; padding: 8px 12px; font-size: 13px;
@@ -1180,6 +1205,10 @@ export default function StudioTracker() {
         .col-empty-on { color: #8B7FFF; background: rgba(139,127,255,0.06); border: 1px dashed rgba(139,127,255,0.3); padding: 20px; }
 
         /* ── CARDS ── */
+        .card-view-only { cursor: pointer; }
+        .team-chip-view { cursor: default; }
+        .team-chip-view .chip-grip { display: none; }
+        .ui-input:disabled, .ui-select:disabled, .ui-textarea:disabled { opacity: 0.85; cursor: default; }
         .card { background: #1C1C24; border: 1px solid #2A2A36; border-radius: 10px; position: relative; cursor: grab; display: flex; width: 100%; transition: box-shadow 0.15s, border-color 0.15s, opacity 0.15s, transform 0.1s; user-select: none; -webkit-user-select: none; touch-action: none; }
         .card:hover { border-color: #3A3A50; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
         .card:active { cursor: grabbing; }
@@ -1444,10 +1473,10 @@ export default function StudioTracker() {
         <div className="brand">
           <div className="brand-mark">◈</div>
           <span className="brand-name">Studio</span>
-          <span className="brand-tag">· Centric PPM</span>
           <span className={`sync-pill ${window.storage?.mode === "shared" ? "" : "local"}`}>
             {window.storage?.mode === "shared" ? "Team board" : "This device only"}
           </span>
+          {isViewer && <span className="sync-pill viewer">View only</span>}
         </div>
         <div className="header-right">
           {/* Page nav */}
@@ -1462,8 +1491,14 @@ export default function StudioTracker() {
               <button className={`view-btn ${view === "list"     ? "active" : ""}`} onClick={() => setView("list")}>List</button>
               <button className={`view-btn ${view === "calendar" ? "active" : ""}`} onClick={() => setView("calendar")}>Calendar</button>
             </div>
-            <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New</button>
+            {canEdit && <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New</button>}
           </>}
+          {teamProfile && TEAM.some(t => t.name === teamProfile) && (
+            <div className="header-profile" title="Your team profile">
+              <span className="av av-sm" style={{ background: teamColor(teamProfile) }}>{initials(teamProfile)}</span>
+              <span className="header-profile-name">{teamProfile}</span>
+            </div>
+          )}
           <UserButton
             afterSignOutUrl="/"
             appearance={{
@@ -1475,7 +1510,7 @@ export default function StudioTracker() {
 
       {page === "selectsets" ? (
         <main className="main">
-          <SelectSetsPage sets={sets} projects={projects} onSave={handleSSave} onDelete={handleSDelete} />
+          <SelectSetsPage sets={sets} projects={projects} onSave={handleSSave} onDelete={handleSDelete} canEdit={canEdit} />
         </main>
       ) : (
       <main className="main">
@@ -1533,7 +1568,7 @@ export default function StudioTracker() {
         </div>
 
         {view === "board" ? (
-          <Board projects={filtered} onAssign={handleAssign} onReorder={handleReorder} onQuickAdd={handleQuickAdd} onOpen={p => setDrawer({ isNew: false, project: p })} stages={activeStages} />
+          <Board projects={filtered} onAssign={handleAssign} onReorder={handleReorder} onQuickAdd={handleQuickAdd} onOpen={p => setDrawer({ isNew: false, project: p })} stages={activeStages} canEdit={canEdit} />
         ) : view === "list" ? (
           <ListView projects={filtered.filter(p => p.stage !== "archived")} onOpen={p => setDrawer({ isNew: false, project: p })} />
         ) : (
@@ -1542,7 +1577,7 @@ export default function StudioTracker() {
       </main>
       )} {/* end page conditional */}
 
-      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onClose={() => setDrawer(null)} presentations={presentationProjects} />}
+      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onClose={() => setDrawer(null)} presentations={presentationProjects} readOnly={!canEdit} defaultAssigneeName={defaultAssignee(teamProfile)} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
