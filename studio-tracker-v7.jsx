@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from "react";
-import { UserButton } from "@clerk/clerk-react";
+import { UserButton, useUser } from "@clerk/clerk-react";
 import { useAppRole } from "./src/useAppRole.js";
+
+const MAX_ACTIVITY = 50;
 
 const defaultAssignee = (teamProfile) =>
   (teamProfile && TEAM.some(t => t.name === teamProfile) ? teamProfile : TEAM[0].name);
@@ -28,6 +30,7 @@ const C = {
 const STAGES = [
   { id: "concept",    label: "Concept",    dot: "#6B7280" },
   { id: "design_dev", label: "Design",     dot: "#818CF8" },
+  { id: "awaiting_sales", label: "Awaiting Sales", dot: "#FBBF24" },
   { id: "tech_pack",  label: "Tech Pack",  dot: "#60A5FA" },
   { id: "sampling",   label: "Sampling",   dot: "#C084FC" },
   { id: "revision",   label: "Revision",   dot: "#FB923C" },
@@ -72,6 +75,206 @@ const stageOf   = (id) => ALL_STAGES.find(s => s.id === id) || STAGES[0];
 const initials  = (name) => name.split(" ").map(w => w[0]).join("");
 const fmt       = (d) => d ? new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—";
 const daysUntil = (d) => d ? Math.ceil((new Date(d) - new Date()) / 86400000) : null;
+
+const stopCardClick = (e) => e.stopPropagation();
+
+const normalizeStyleEntries = (v) => {
+  if (!v) return [];
+  const raw = Array.isArray(v) ? v : String(v).split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    let entry;
+    if (typeof item === "string") entry = { label: item, url: "" };
+    else if (item && typeof item === "object") {
+      entry = {
+        label: String(item.label ?? item.sku ?? "").trim(),
+        url: String(item.url ?? item.link ?? "").trim(),
+      };
+    } else continue;
+    if (!entry.label || seen.has(entry.label)) continue;
+    seen.add(entry.label);
+    out.push(entry);
+  }
+  return out;
+};
+const styleNumbersOf = (p) =>
+  normalizeStyleEntries(p?.styleNumbers).flatMap(e => [e.label, e.url].filter(Boolean));
+
+const skuLabels = (p) => normalizeStyleEntries(p?.styleNumbers).map(e => e.label);
+
+function activityActor(teamProfile, user) {
+  if (teamProfile) return teamProfile;
+  if (user?.fullName?.trim()) return user.fullName.trim();
+  const email = user?.primaryEmailAddress?.emailAddress;
+  if (email) return email.split("@")[0];
+  return "Team member";
+}
+
+function formatActivityTime(iso) {
+  const d = new Date(iso);
+  const mins = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  return d.toLocaleDateString("en-US", {
+    month: "short", day: "numeric",
+    year: d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
+  });
+}
+
+function newActivityEntry(by, text) {
+  return {
+    id: `a${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    at: new Date().toISOString(),
+    by,
+    text,
+  };
+}
+
+function diffProjectActivity(prev, next, by) {
+  if (!prev) return [newActivityEntry(by, "Created project")];
+  const entries = [];
+  if (prev.stage !== next.stage) {
+    entries.push(newActivityEntry(by, `Moved to ${stageOf(next.stage).label}`));
+  }
+  if (prev.assignee !== next.assignee) {
+    entries.push(newActivityEntry(by, `Assigned to ${next.assignee}`));
+  }
+  if (prev.title !== next.title) {
+    entries.push(newActivityEntry(by, `Renamed to “${next.title}”`));
+  }
+  if (prev.category !== next.category) {
+    entries.push(newActivityEntry(by, `Category → ${catLabel(next.category)}`));
+  }
+  if (prev.season !== next.season) {
+    entries.push(newActivityEntry(by, `Season → ${next.season}`));
+  }
+  if ((prev.dueDate || "") !== (next.dueDate || "")) {
+    entries.push(newActivityEntry(by, next.dueDate ? `Due date → ${fmt(next.dueDate)}` : "Cleared due date"));
+  }
+  if ((prev.startDate || "") !== (next.startDate || "")) {
+    entries.push(newActivityEntry(by, next.startDate ? `Start date → ${fmt(next.startDate)}` : "Cleared start date"));
+  }
+  if ((prev.notes || "") !== (next.notes || "")) {
+    entries.push(newActivityEntry(by, "Updated status notes"));
+  }
+  const prevSku = skuLabels(prev).join("|");
+  const nextSku = skuLabels(next).join("|");
+  if (prevSku !== nextSku) {
+    const prevSet = new Set(skuLabels(prev));
+    const nextSet = new Set(skuLabels(next));
+    const added = skuLabels(next).filter(l => !prevSet.has(l));
+    const removed = skuLabels(prev).filter(l => !nextSet.has(l));
+    if (added.length) {
+      entries.push(newActivityEntry(by, `Added SKU${added.length > 1 ? "s" : ""}: ${added.join(", ")}`));
+    }
+    if (removed.length) {
+      entries.push(newActivityEntry(by, `Removed SKU${removed.length > 1 ? "s" : ""}: ${removed.join(", ")}`));
+    }
+  }
+  if ((prev.sourcePresId || "") !== (next.sourcePresId || "")) {
+    if (!next.sourcePresId) entries.push(newActivityEntry(by, "Unlinked source presentation"));
+    else entries.push(newActivityEntry(by, "Linked to a source presentation"));
+  }
+  return entries;
+}
+
+function withActivity(prev, next, by) {
+  const added = diffProjectActivity(prev, next, by);
+  if (!added.length) return next;
+  const activity = [...added, ...(next.activity || prev?.activity || [])].slice(0, MAX_ACTIVITY);
+  return { ...next, activity };
+}
+
+const LINK_MARKDOWN_RE = /\[([^\]]+)\]\(([^)]+)\)|(https?:\/\/[^\s<>"{}|\\^`[\]]+)/g;
+
+function LinkedText({ text, className = "" }) {
+  if (!text?.trim()) return null;
+  const nodes = [];
+  let last = 0;
+  let m;
+  const re = new RegExp(LINK_MARKDOWN_RE.source, "g");
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) nodes.push(<span key={`t-${last}`}>{text.slice(last, m.index)}</span>);
+    const label = m[1] ?? m[3];
+    const url = (m[2] ?? m[3]).trim();
+    nodes.push(
+      <a key={`l-${m.index}`} href={url} target="_blank" rel="noopener noreferrer"
+        className="text-link" onClick={stopCardClick}>{label}</a>
+    );
+    last = re.lastIndex;
+  }
+  if (last < text.length) nodes.push(<span key={`t-${last}`}>{text.slice(last)}</span>);
+  return <span className={`linked-text ${className}`.trim()}>{nodes}</span>;
+}
+
+function StyleSkuSection({ value, onChange, canEdit }) {
+  const entries = normalizeStyleEntries(value);
+  const [draftLabel, setDraftLabel] = useState("");
+  const [draftUrl, setDraftUrl] = useState("");
+  const add = () => {
+    const label = draftLabel.trim();
+    const url = draftUrl.trim();
+    if (!label || !url || entries.some(e => e.label === label)) {
+      setDraftLabel("");
+      setDraftUrl("");
+      return;
+    }
+    onChange([...entries, { label, url }]);
+    setDraftLabel("");
+    setDraftUrl("");
+  };
+  if (!canEdit && !entries.length) return null;
+  return (
+    <div className="sku-below-comments">
+      <div className="field-label">Style numbers</div>
+      {entries.length > 0 ? (
+        <ul className="sku-link-list">
+          {entries.map((e, i) => (
+            <li key={`${e.label}-${i}`} className="sku-link-item">
+              <a href={e.url} target="_blank" rel="noopener noreferrer" className="sku-hyperlink">{e.label}</a>
+              {canEdit && (
+                <button type="button" className="sku-remove-text"
+                  onClick={() => onChange(entries.filter((_, j) => j !== i))}>Remove</button>
+              )}
+            </li>
+          ))}
+        </ul>
+      ) : canEdit ? (
+        <div className="sku-empty-hint">Add SKUs with Centric links below</div>
+      ) : null}
+      {canEdit && (
+        <div className="sku-add-row">
+          <input value={draftLabel} onChange={e => setDraftLabel(e.target.value)} className="ui-input"
+            placeholder="SKU" onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
+          <input value={draftUrl} onChange={e => setDraftUrl(e.target.value)} className="ui-input"
+            placeholder="Centric URL" onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
+          <button type="button" className="btn-add-sku" onClick={add} disabled={!draftLabel.trim() || !draftUrl.trim()}>Add</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StyleSkuCardLinks({ numbers, max = 3 }) {
+  const entries = normalizeStyleEntries(numbers).filter(e => e.url);
+  if (!entries.length) return null;
+  const shown = entries.slice(0, max);
+  const extra = entries.length - shown.length;
+  return (
+    <div className="card-sku-chips">
+      {shown.map((e, i) => (
+        <a key={`${e.label}-${i}`} href={e.url} target="_blank" rel="noopener noreferrer"
+          className="sku-chip sku-chip-link" onClick={stopCardClick} title={e.url}>{e.label}</a>
+      ))}
+      {extra > 0 && <span className="sku-chip sku-chip-more">+{extra}</span>}
+    </div>
+  );
+}
 
 async function load() { try { const r = await window.storage.get("st_v10"); return r ? JSON.parse(r.value) : SEED; } catch { return SEED; } }
 async function save(p) { await window.storage.set("st_v10", JSON.stringify(p)); }
@@ -145,6 +348,7 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, c
           </span>
           <span className="card-season">{project.season}</span>
         </div>
+        <StyleSkuCardLinks numbers={project.styleNumbers} />
         <div className="card-footer">
           <div className="card-assignee">
             <span className="av av-sm" style={{ background: teamColor(project.assignee) }}>
@@ -449,6 +653,7 @@ function ListView({ projects, onOpen }) {
                   <span className="cat-chip sm" style={{ background: `${cc}22`, color: cc, border: `1px solid ${cc}44` }}>{catLabel(p.category)}</span>
                   <span className="sep">·</span><span>{p.season}</span>
                 </div>
+                <StyleSkuCardLinks numbers={p.styleNumbers} max={5} />
               </div>
               <div className="list-stage-pill">
                 <span className="stage-dot" style={{ background: stage.dot }} />
@@ -586,16 +791,38 @@ function CalendarView({ projects, onOpen }) {
   );
 }
 
+function ActivityLog({ activity }) {
+  const items = activity || [];
+  return (
+    <div className="activity-log">
+      <div className="field-label">Activity</div>
+      {items.length === 0 ? (
+        <div className="activity-empty">No activity yet — moves, edits, and SKUs will show here.</div>
+      ) : (
+        <ul className="activity-list">
+          {items.map(a => (
+            <li key={a.id} className="activity-item">
+              <div className="activity-text">{a.text}</div>
+              <div className="activity-meta">{a.by} · {formatActivityTime(a.at)}</div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 // ─── DRAWER ──────────────────────────────────────────────────────────────────
 function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, readOnly = false, defaultAssigneeName = TEAM[0].name }) {
   const [form, setForm] = useState(project || {
     title: "", category: "apparel", stage: "concept", projectType: "product",
     assignee: defaultAssigneeName, season: "SS26",
-    startDate: "", dueDate: "", notes: "", presentationId: "", sourcePresId: "",
+    startDate: "", dueDate: "", notes: "", styleNumbers: [], presentationId: "", sourcePresId: "",
   });
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const [confirmDelete, setConfirmDelete] = useState(false);
   const isPresentation = form.projectType === "presentation";
+  const isAwaitingSales = !isPresentation && form.stage === "awaiting_sales";
   const stageOptions   = isPresentation ? PRES_STAGES : STAGES;
   return (
     <>
@@ -641,11 +868,29 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, read
                 </Select>
               </Field>
             )}
-            <Field label="Status Notes" full><Textarea rows={4} value={form.notes} onChange={e => set("notes", e.target.value)} disabled={readOnly} placeholder="Latest updates, blockers, next steps..." /></Field>
+            <Field label="Status Notes" full>
+              <Textarea rows={4} value={form.notes} onChange={e => set("notes", e.target.value)} disabled={readOnly}
+                placeholder="Latest updates, blockers, next steps…" />
+              {form.notes?.trim() && (
+                <div className="notes-rendered"><LinkedText text={form.notes} /></div>
+              )}
+            </Field>
+            {!isPresentation && (isAwaitingSales || normalizeStyleEntries(form.styleNumbers).length > 0) && (
+              <StyleSkuSection
+                value={form.styleNumbers}
+                onChange={v => set("styleNumbers", v)}
+                canEdit={isAwaitingSales && !readOnly}
+              />
+            )}
           </div>
+          {!isNew && <ActivityLog activity={form.activity} />}
           {!readOnly ? (
           <div className="drawer-actions">
-            <button onClick={() => onSave({ ...form, id: form.id || `p${Date.now()}` })} disabled={!form.title.trim()} className="btn-primary">
+            <button onClick={() => onSave({
+              ...form,
+              id: form.id || `p${Date.now()}`,
+              styleNumbers: normalizeStyleEntries(form.styleNumbers),
+            })} disabled={!form.title.trim()} className="btn-primary">
               {isNew ? "Create project" : "Save changes"}
             </button>
             {!isNew && (
@@ -735,7 +980,13 @@ function SSDrawer({ set, isNew, onSave, onClose, onDelete, readOnly = false }) {
             </Field>
             <Field label="Notes" full>
               <Textarea rows={3} value={form.notes} onChange={e => s("notes", e.target.value)} disabled={readOnly}
-                placeholder="Any context, deadlines, or instructions…" />
+                placeholder="Notes… [label](https://…) or paste a URL for links" />
+              {form.notes?.trim() && (
+                <div className="linked-text-preview">
+                  <span className="preview-label">Preview</span>
+                  <LinkedText text={form.notes} />
+                </div>
+              )}
             </Field>
           </div>
           {!readOnly ? (
@@ -859,7 +1110,7 @@ function SelectSetsPage({ sets, projects, onSave, onDelete, canEdit = true }) {
                             <button onClick={() => setDrawer({ isNew: false, set })} className="ss-edit-btn">{canEdit ? "Edit" : "View"}</button>
                           </div>
                         </div>
-                        {set.notes && <div className="ss-card-notes">{set.notes}</div>}
+                        {set.notes && <div className="ss-card-notes"><LinkedText text={set.notes} /></div>}
                       </div>
                     );
                   })}
@@ -895,6 +1146,8 @@ function SelectSetsPage({ sets, projects, onSave, onDelete, canEdit = true }) {
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function StudioTracker() {
   const { canEdit, isViewer, teamProfile } = useAppRole();
+  const { user } = useUser();
+  const actor = activityActor(teamProfile, user);
   const [projects,       setProjects]       = useState([]);
   const [sets,           setSets]           = useState([]);
   const [loading,        setLoading]        = useState(true);
@@ -978,32 +1231,37 @@ export default function StudioTracker() {
     if (!canEdit) return;
     const proj = projects.find(p => p.id === id);
     if (!proj || proj.assignee === name) return;
-    const next = projects.map(p => p.id === id ? { ...p, assignee: name } : p);
+    const updated = withActivity(proj, { ...proj, assignee: name }, actor);
+    const next = projects.map(p => p.id === id ? updated : p);
     saveProjects(next, `"${proj.title}" → ${name}`);
-  }, [projects, saveProjects]);
+  }, [projects, saveProjects, actor, canEdit]);
 
   const handleReorder = useCallback((id, newStage, beforeId) => {
     if (!canEdit) return;
     const proj = projects.find(p => p.id === id);
     if (!proj) return;
     let next = projects.filter(p => p.id !== id);
-    const updated = { ...proj, stage: newStage };
+    const updated = withActivity(proj, { ...proj, stage: newStage }, actor);
     if (beforeId) { const i = next.findIndex(p => p.id === beforeId); next.splice(i >= 0 ? i : next.length, 0, updated); }
     else { const idxs = next.map((p, i) => p.stage === newStage ? i : -1).filter(i => i >= 0); next.splice(idxs.length ? idxs[idxs.length - 1] + 1 : next.length, 0, updated); }
     const msg = proj.stage !== newStage ? `Moved to ${stageOf(newStage).label}` : null;
     saveProjects(next, msg);
-  }, [projects, saveProjects]);
+  }, [projects, saveProjects, actor, canEdit]);
 
   const handleQuickAdd = useCallback((stageId, title) => {
     if (!canEdit) return;
-    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignee: assigneeFilter || defaultAssignee(teamProfile), season: "SS26", dueDate: "", notes: "" };
-    saveProjects([...projects, p], `Added "${title}"`);
-  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, teamProfile, canEdit]);
+    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignee: assigneeFilter || defaultAssignee(teamProfile), season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [] };
+    const created = withActivity(null, p, actor);
+    saveProjects([...projects, created], `Added "${title}"`);
+  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, teamProfile, canEdit, actor]);
 
   const handleSave = (data) => {
     if (!canEdit) return;
     const exists = projects.some(p => p.id === data.id);
-    const next = exists ? projects.map(p => p.id === data.id ? data : p) : [data, ...projects];
+    const prev = exists ? projects.find(p => p.id === data.id) : null;
+    const payload = { ...data, styleNumbers: normalizeStyleEntries(data.styleNumbers) };
+    const updated = withActivity(prev, payload, actor);
+    const next = exists ? projects.map(p => p.id === data.id ? updated : p) : [updated, ...projects];
     saveProjects(next);
     setDrawer(null);
   };
@@ -1017,7 +1275,8 @@ export default function StudioTracker() {
   const catPool = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const asnOk  = !assigneeFilter || p.assignee === assigneeFilter;
-    const txtOk  = !search || p.title.toLowerCase().includes(search.toLowerCase());
+    const q = search.toLowerCase();
+    const txtOk  = !search || p.title.toLowerCase().includes(q) || styleNumbersOf(p).some(s => s.toLowerCase().includes(q));
     return typeOk && asnOk && txtOk && p.stage !== "archived";
   });
   const catCounts = CATEGORIES.reduce((a, c) => {
@@ -1028,7 +1287,8 @@ export default function StudioTracker() {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const catOk  = categoryFilter === "all" || p.category === categoryFilter;
     const asnOk  = !assigneeFilter || p.assignee === assigneeFilter;
-    const txtOk  = !search || p.title.toLowerCase().includes(search.toLowerCase());
+    const q = search.toLowerCase();
+    const txtOk  = !search || p.title.toLowerCase().includes(q) || styleNumbersOf(p).some(s => s.toLowerCase().includes(q));
     return typeOk && catOk && asnOk && txtOk;
   });
   const activeStages  = boardMode === "presentations" ? PRES_STAGES : STAGES;
@@ -1219,7 +1479,34 @@ export default function StudioTracker() {
         .card-body { padding: 11px 12px; flex: 1; min-width: 0; }
         .card-title { font-size: 13px; font-weight: 600; color: #F0F0F6; line-height: 1.4; margin-bottom: 7px; }
         .card-tags { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+        .card-sku-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+        .sku-chip { font-size: 10px; font-weight: 600; font-family: ui-monospace, monospace; padding: 3px 7px; border-radius: 4px; background: rgba(251,191,36,0.12); color: #FBBF24; border: 1px solid rgba(251,191,36,0.28); line-height: 1.3; }
+        a.sku-chip-link { text-decoration: none; cursor: pointer; transition: background 0.15s, border-color 0.15s, color 0.15s; }
+        a.sku-chip-link:hover { color: #FDE68A; border-color: rgba(251,191,36,0.55); background: rgba(251,191,36,0.22); }
+        .sku-chip-more { background: #1E1E28; color: #56566A; border-color: #2A2A36; cursor: default; }
         .card-season { font-size: 11px; color: #56566A; }
+        .sku-below-comments { grid-column: 1 / -1; margin-top: 4px; padding-top: 14px; border-top: 1px solid #2A2A36; }
+        .sku-link-list { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+        .sku-link-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+        .sku-hyperlink { font-size: 13px; font-weight: 600; color: #8B7FFF; text-decoration: underline; text-underline-offset: 2px; font-family: ui-monospace, monospace; }
+        .sku-hyperlink:hover { color: #A89FFF; }
+        .sku-plain { font-size: 13px; color: #9494B0; font-family: ui-monospace, monospace; }
+        .sku-remove-text { background: none; border: none; color: #56566A; font-size: 11px; cursor: pointer; flex-shrink: 0; }
+        .sku-remove-text:hover { color: #F87171; }
+        .sku-add-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
+        .sku-add-row .ui-input { min-width: 0; }
+        .sku-empty-hint { font-size: 12px; color: #56566A; margin-bottom: 10px; }
+        .notes-rendered { margin-top: 10px; padding-top: 10px; border-top: 1px solid #2A2A36; font-size: 13px; line-height: 1.55; color: #9494B0; }
+        .text-link { color: #8B7FFF; text-decoration: underline; text-underline-offset: 2px; }
+        .text-link:hover { color: #A89FFF; }
+        .linked-text { white-space: pre-wrap; word-break: break-word; }
+        .linked-text-preview { margin-top: 8px; padding: 10px 12px; background: #14141A; border: 1px solid #2A2A36; border-radius: 8px; font-size: 12px; line-height: 1.55; color: #9494B0; }
+        .preview-label { display: block; font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #56566A; margin-bottom: 6px; }
+        .btn-add-sku { flex-shrink: 0; padding: 8px 12px; background: #23232D; border: 1px solid #2A2A36; border-radius: 8px; color: #9494B0; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; }
+        .btn-add-sku:hover:not(:disabled) { border-color: #8B7FFF; color: #8B7FFF; }
+        .btn-add-sku:disabled { opacity: 0.4; cursor: default; }
+        .style-numbers-empty { font-size: 12px; color: #56566A; }
+        .field-hint { font-size: 11px; color: #56566A; margin-top: 8px; }
         .card-footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
         .card-assignee { display: flex; align-items: center; gap: 5px; min-width: 0; }
         .card-name { font-size: 11px; color: #9494B0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1286,6 +1573,12 @@ export default function StudioTracker() {
         input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.4); cursor: pointer; }
         .sync-toggle { display: flex; align-items: center; gap: 10px; margin-top: 20px; font-size: 13px; color: #9494B0; cursor: pointer; }
         .sync-toggle input { accent-color: #8B7FFF; width: 16px; height: 16px; }
+        .activity-log { margin-top: 20px; padding-top: 16px; border-top: 1px solid #2A2A36; }
+        .activity-list { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+        .activity-item { padding: 8px 10px; background: #14141A; border-radius: 8px; border: 1px solid #1E1E28; }
+        .activity-text { font-size: 12px; color: #F0F0F6; line-height: 1.4; }
+        .activity-meta { font-size: 10px; color: #56566A; margin-top: 4px; }
+        .activity-empty { font-size: 12px; color: #56566A; line-height: 1.45; }
         .drawer-actions { display: flex; gap: 10px; margin-top: 24px; }
         .btn-primary { flex: 1; padding: 13px 0; font-size: 14px; font-weight: 700; background: #8B7FFF; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-family: inherit; min-height: 46px; transition: opacity 0.15s; }
         .btn-primary:hover { opacity: 0.88; }
