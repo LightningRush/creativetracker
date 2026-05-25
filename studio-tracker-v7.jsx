@@ -66,6 +66,23 @@ const TEAM = [
 ];
 const teamColor = (name) => TEAM.find(t => t.name === name)?.color || "#9494B0";
 
+const projectAssignees = (p) => {
+  if (!p) return [];
+  if (Array.isArray(p.assignees) && p.assignees.length) {
+    return [...new Set(p.assignees.filter(n => TEAM.some(t => t.name === n)))];
+  }
+  if (p.assignee && TEAM.some(t => t.name === p.assignee)) return [p.assignee];
+  return [];
+};
+const projectHasAssignee = (p, name) => projectAssignees(p).includes(name);
+const assigneesLabel = (names) =>
+  names.length <= 2 ? names.join(", ") : `${names[0]} +${names.length - 1}`;
+const normalizeProjectForSave = (p) => {
+  const assignees = projectAssignees(p);
+  const { assignee: _legacy, ...rest } = p;
+  return { ...rest, assignees: assignees.length ? assignees : [TEAM[0].name] };
+};
+
 const SEASONS = ["SS25", "FW25", "SS26", "FW26", "Resort 26", "Evergreen"];
 
 const SEED = [];
@@ -73,8 +90,27 @@ const SEED = [];
 const ALL_STAGES = [...STAGES, ...PRES_STAGES.filter(s => s.id !== "archived")];
 const stageOf   = (id) => ALL_STAGES.find(s => s.id === id) || STAGES[0];
 const initials  = (name) => name.split(" ").map(w => w[0]).join("");
-const fmt       = (d) => d ? new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—";
-const daysUntil = (d) => d ? Math.ceil((new Date(d) - new Date()) / 86400000) : null;
+// Date inputs are YYYY-MM-DD — parse as local midnight (not UTC) to match calendar view
+const parseLocalDate = (d) => {
+  if (!d) return null;
+  const s = String(d).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return new Date(`${s}T00:00:00`);
+  const parsed = new Date(s);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+const fmt       = (d) => {
+  const x = parseLocalDate(d);
+  return x ? x.toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—";
+};
+const daysUntil = (d) => {
+  const due = parseLocalDate(d);
+  if (!due) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  due.setHours(0, 0, 0, 0);
+  return Math.round((due - today) / 86400000);
+};
 
 const stopCardClick = (e) => e.stopPropagation();
 
@@ -141,8 +177,13 @@ function diffProjectActivity(prev, next, by) {
   if (prev.stage !== next.stage) {
     entries.push(newActivityEntry(by, `Moved to ${stageOf(next.stage).label}`));
   }
-  if (prev.assignee !== next.assignee) {
-    entries.push(newActivityEntry(by, `Assigned to ${next.assignee}`));
+  const prevAs = projectAssignees(prev);
+  const nextAs = projectAssignees(next);
+  if (prevAs.join("\0") !== nextAs.join("\0")) {
+    const added = nextAs.filter(n => !prevAs.includes(n));
+    const removed = prevAs.filter(n => !nextAs.includes(n));
+    if (added.length) entries.push(newActivityEntry(by, `Added to team: ${added.join(", ")}`));
+    if (removed.length) entries.push(newActivityEntry(by, `Removed from team: ${removed.join(", ")}`));
   }
   if (prev.title !== next.title) {
     entries.push(newActivityEntry(by, `Renamed to “${next.title}”`));
@@ -276,8 +317,17 @@ function StyleSkuCardLinks({ numbers, max = 3 }) {
   );
 }
 
-async function load() { try { const r = await window.storage.get("st_v10"); return r ? JSON.parse(r.value) : SEED; } catch { return SEED; } }
-async function save(p) { await window.storage.set("st_v10", JSON.stringify(p)); }
+async function load() {
+  try {
+    const r = await window.storage.get("st_v10");
+    const raw = r ? JSON.parse(r.value) : SEED;
+    return Array.isArray(raw) ? raw.map(normalizeProjectForSave) : SEED;
+  } catch { return SEED; }
+}
+async function save(p) {
+  const next = Array.isArray(p) ? p.map(normalizeProjectForSave) : p;
+  await window.storage.set("st_v10", JSON.stringify(next));
+}
 
 // ─── SELECT SETS DATA ────────────────────────────────────────────────────────
 const CUSTOMERS = [
@@ -299,6 +349,56 @@ const ssStatusOf = (id) => SS_STATUS.find(s => s.id === id) || SS_STATUS[0];
 async function loadSS() { try { const r = await window.storage.get("ss_v1"); return r ? JSON.parse(r.value) : []; } catch { return []; } }
 async function saveSS(s) { await window.storage.set("ss_v1", JSON.stringify(s)); }
 
+function AssigneeAvatars({ project, size = "sm", maxShow = 3, compact = false }) {
+  const names = projectAssignees(project);
+  if (!names.length) return null;
+  const shown = names.slice(0, maxShow);
+  const extra = names.length - shown.length;
+  return (
+    <div className={`assignee-avatars ${compact ? "compact" : ""}`}>
+      <div className="av-stack">
+        {shown.map(n => (
+          <span key={n} className={`av av-${size}`} style={{ background: teamColor(n) }} title={n}>
+            {initials(n)}
+          </span>
+        ))}
+        {extra > 0 && <span className={`av av-${size} av-more`} title={names.slice(maxShow).join(", ")}>+{extra}</span>}
+      </div>
+      {!compact && <span className="card-name" title={names.join(", ")}>{assigneesLabel(names)}</span>}
+    </div>
+  );
+}
+
+function AssigneePicker({ assignees, onChange, readOnly }) {
+  const selected = projectAssignees({ assignees });
+  const toggle = (name) => {
+    if (readOnly) return;
+    if (selected.includes(name)) {
+      if (selected.length <= 1) return;
+      onChange(selected.filter(n => n !== name));
+    } else {
+      onChange([...selected, name]);
+    }
+  };
+  return (
+    <div className="assignee-picker">
+      {TEAM.map(t => {
+        const on = selected.includes(t.name);
+        return (
+          <button key={t.name} type="button" disabled={readOnly}
+            className={`assignee-pick-btn ${on ? "on" : ""}`}
+            style={{ "--tc": t.color }}
+            onClick={() => toggle(t.name)}>
+            <span className="av av-xs" style={{ background: t.color }}>{initials(t.name)}</span>
+            {t.name}
+          </button>
+        );
+      })}
+      {!readOnly && <div className="field-hint">Select everyone working on this project</div>}
+    </div>
+  );
+}
+
 // ─── HEATMAP CARD ────────────────────────────────────────────────────────────
 function HeatmapCard({ projects }) {
   const active = projects.filter(p => p.stage !== "archived");
@@ -309,7 +409,7 @@ function HeatmapCard({ projects }) {
       <div className="stat-label" style={{ marginBottom: 10 }}>Team Load</div>
       <div className="hm-chips">
         {TEAM.map(t => {
-          const count = active.filter(p => p.assignee === t.name).length;
+          const count = active.filter(p => projectHasAssignee(p, t.name)).length;
           const color = loadColor(count);
           return (
             <div key={t.name} className="hm-chip"
@@ -351,10 +451,7 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, c
         <StyleSkuCardLinks numbers={project.styleNumbers} />
         <div className="card-footer">
           <div className="card-assignee">
-            <span className="av av-sm" style={{ background: teamColor(project.assignee) }}>
-              {initials(project.assignee)}
-            </span>
-            <span className="card-name">{project.assignee}</span>
+            <AssigneeAvatars project={project} />
           </div>
           <div className="card-right">
             {project.dueDate && (
@@ -546,7 +643,7 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
       <div className="team-strip">
         <div className="team-strip-top">
           <span className="strip-label">Team</span>
-          <span className="strip-hint">{!canEdit ? "View only — click a card for details" : isDC ? "Drop on teammate to reassign" : isDT ? "Drop onto any project card" : "Drag cards to move · drag teammates to reassign"}</span>
+          <span className="strip-hint">{!canEdit ? "View only — click a card for details" : isDC ? "Drop on teammate to add them to the project" : isDT ? "Drop onto a card to add teammate" : "Drag cards to move · drop on teammate to add to project"}</span>
         </div>
         <div className="team-row">
           {TEAM.map(t => {
@@ -660,8 +757,7 @@ function ListView({ projects, onOpen }) {
                 {stage.label}
               </div>
               <div className="list-assignee">
-                <span className="av av-sm" style={{ background: teamColor(p.assignee) }}>{initials(p.assignee)}</span>
-                <span className="list-name">{p.assignee}</span>
+                <AssigneeAvatars project={p} maxShow={2} />
               </div>
               <div className={`list-due ${overdue ? "c-red" : ""}`}>
                 {p.dueDate ? (overdue ? `${Math.abs(days)}d late` : fmt(p.dueDate)) : "—"}
@@ -760,9 +856,9 @@ function CalendarView({ projects, onOpen }) {
                           marginRight: capR ? "2px" : "0",
                         }}
                         onClick={() => onOpen(p)}
-                        title={`${p.title} · ${p.assignee}${dur ? ` · ${dur} days` : ""}`}
+                        title={`${p.title} · ${projectAssignees(p).join(", ")}${dur ? ` · ${dur} days` : ""}`}
                       >
-                        <span className="av av-xs" style={{ background: teamColor(p.assignee) }}>{initials(p.assignee)}</span>
+                        <AssigneeAvatars project={p} size="xs" maxShow={2} compact />
                         <span className="bar-title">{p.title}</span>
                         {capR && dur && <span className="bar-dur">{dur}d</span>}
                       </div>
@@ -814,10 +910,13 @@ function ActivityLog({ activity }) {
 
 // ─── DRAWER ──────────────────────────────────────────────────────────────────
 function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, readOnly = false, defaultAssigneeName = TEAM[0].name }) {
-  const [form, setForm] = useState(project || {
-    title: "", category: "apparel", stage: "concept", projectType: "product",
-    assignee: defaultAssigneeName, season: "SS26",
-    startDate: "", dueDate: "", notes: "", styleNumbers: [], presentationId: "", sourcePresId: "",
+  const [form, setForm] = useState(() => {
+    if (project) return { ...project, assignees: projectAssignees(project) };
+    return {
+      title: "", category: "apparel", stage: "concept", projectType: "product",
+      assignees: [defaultAssigneeName], season: "SS26",
+      startDate: "", dueDate: "", notes: "", styleNumbers: [], presentationId: "", sourcePresId: "",
+    };
   });
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -857,7 +956,13 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, read
               <Field label="Customer"><Select value={form.customer || ""} onChange={e => set("customer", e.target.value)} disabled={readOnly}><option value="">— Select —</option>{CUSTOMERS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</Select></Field>
             )}
             <Field label="Season"><Select value={form.season} onChange={e => set("season", e.target.value)} disabled={readOnly}>{SEASONS.map(s => <option key={s}>{s}</option>)}</Select></Field>
-            <Field label="Assignee"><Select value={form.assignee} onChange={e => set("assignee", e.target.value)} disabled={readOnly}>{TEAM.map(t => <option key={t.name}>{t.name}</option>)}</Select></Field>
+            <Field label="Art team" full>
+              <AssigneePicker
+                assignees={form.assignees}
+                onChange={v => set("assignees", v)}
+                readOnly={readOnly}
+              />
+            </Field>
             <Field label="Start Date"><Input type="date" value={form.startDate} onChange={e => set("startDate", e.target.value)} disabled={readOnly} /></Field>
             <Field label="End / Due Date"><Input type="date" value={form.dueDate} onChange={e => set("dueDate", e.target.value)} disabled={readOnly} /></Field>
             {!isPresentation && presentations && presentations.length > 0 && (
@@ -886,11 +991,11 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, read
           {!isNew && <ActivityLog activity={form.activity} />}
           {!readOnly ? (
           <div className="drawer-actions">
-            <button onClick={() => onSave({
+            <button onClick={() => onSave(normalizeProjectForSave({
               ...form,
               id: form.id || `p${Date.now()}`,
               styleNumbers: normalizeStyleEntries(form.styleNumbers),
-            })} disabled={!form.title.trim()} className="btn-primary">
+            }))} disabled={!form.title.trim()} className="btn-primary">
               {isNew ? "Create project" : "Save changes"}
             </button>
             {!isNew && (
@@ -1179,16 +1284,18 @@ export default function StudioTracker() {
       }
     })();
 
-    const applyRemote = (setter, raw) => {
+    const applyRemote = (setter, raw, normalize) => {
       try {
-        setter(JSON.parse(raw));
+        let data = JSON.parse(raw);
+        if (normalize && Array.isArray(data)) data = data.map(normalizeProjectForSave);
+        setter(data);
       } catch {
         /* ignore malformed payloads */
       }
     };
 
     const unsubProjects =
-      window.storage.subscribe?.("st_v10", (value) => applyRemote(setProjects, value)) ??
+      window.storage.subscribe?.("st_v10", (value) => applyRemote(setProjects, value, true)) ??
       (() => {});
 
     const unsubSets =
@@ -1230,10 +1337,13 @@ export default function StudioTracker() {
   const handleAssign = useCallback((id, name) => {
     if (!canEdit) return;
     const proj = projects.find(p => p.id === id);
-    if (!proj || proj.assignee === name) return;
-    const updated = withActivity(proj, { ...proj, assignee: name }, actor);
+    if (!proj) return;
+    const current = projectAssignees(proj);
+    if (current.includes(name)) return;
+    const assignees = [...current, name];
+    const updated = withActivity(proj, normalizeProjectForSave({ ...proj, assignees }), actor);
     const next = projects.map(p => p.id === id ? updated : p);
-    saveProjects(next, `"${proj.title}" → ${name}`);
+    saveProjects(next, `Added ${name} to "${proj.title}"`);
   }, [projects, saveProjects, actor, canEdit]);
 
   const handleReorder = useCallback((id, newStage, beforeId) => {
@@ -1250,7 +1360,10 @@ export default function StudioTracker() {
 
   const handleQuickAdd = useCallback((stageId, title) => {
     if (!canEdit) return;
-    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignee: assigneeFilter || defaultAssignee(teamProfile), season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [] };
+    const assignees = assigneeFilter
+      ? [assigneeFilter]
+      : [defaultAssignee(teamProfile)];
+    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [] };
     const created = withActivity(null, p, actor);
     saveProjects([...projects, created], `Added "${title}"`);
   }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, teamProfile, canEdit, actor]);
@@ -1259,7 +1372,10 @@ export default function StudioTracker() {
     if (!canEdit) return;
     const exists = projects.some(p => p.id === data.id);
     const prev = exists ? projects.find(p => p.id === data.id) : null;
-    const payload = { ...data, styleNumbers: normalizeStyleEntries(data.styleNumbers) };
+    const payload = normalizeProjectForSave({
+      ...data,
+      styleNumbers: normalizeStyleEntries(data.styleNumbers),
+    });
     const updated = withActivity(prev, payload, actor);
     const next = exists ? projects.map(p => p.id === data.id ? updated : p) : [updated, ...projects];
     saveProjects(next);
@@ -1274,7 +1390,7 @@ export default function StudioTracker() {
   const presentationProjects = projects.filter(p => p.projectType === "presentation");
   const catPool = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
-    const asnOk  = !assigneeFilter || p.assignee === assigneeFilter;
+    const asnOk  = !assigneeFilter || projectHasAssignee(p, assigneeFilter);
     const q = search.toLowerCase();
     const txtOk  = !search || p.title.toLowerCase().includes(q) || styleNumbersOf(p).some(s => s.toLowerCase().includes(q));
     return typeOk && asnOk && txtOk && p.stage !== "archived";
@@ -1286,7 +1402,7 @@ export default function StudioTracker() {
   const filtered = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const catOk  = categoryFilter === "all" || p.category === categoryFilter;
-    const asnOk  = !assigneeFilter || p.assignee === assigneeFilter;
+    const asnOk  = !assigneeFilter || projectHasAssignee(p, assigneeFilter);
     const q = search.toLowerCase();
     const txtOk  = !search || p.title.toLowerCase().includes(q) || styleNumbersOf(p).some(s => s.toLowerCase().includes(q));
     return typeOk && catOk && asnOk && txtOk;
@@ -1509,6 +1625,17 @@ export default function StudioTracker() {
         .field-hint { font-size: 11px; color: #56566A; margin-top: 8px; }
         .card-footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
         .card-assignee { display: flex; align-items: center; gap: 5px; min-width: 0; }
+        .assignee-avatars { display: flex; align-items: center; gap: 6px; min-width: 0; }
+        .assignee-avatars.compact { gap: 4px; }
+        .av-stack { display: flex; align-items: center; flex-shrink: 0; }
+        .av-stack .av { margin-left: -6px; border: 1.5px solid #1C1C24; box-sizing: border-box; }
+        .av-stack .av:first-child { margin-left: 0; }
+        .av-more { background: #2A2A36 !important; color: #9494B0; font-size: 9px; font-weight: 700; display: flex; align-items: center; justify-content: center; font-family: inherit; }
+        .assignee-picker { display: flex; flex-wrap: wrap; gap: 8px; }
+        .assignee-pick-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 8px; border: 1px solid #2A2A36; background: #14141A; color: #9494B0; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+        .assignee-pick-btn.on { background: color-mix(in srgb, var(--tc) 18%, #14141A); border-color: color-mix(in srgb, var(--tc) 50%, #2A2A36); color: #F0F0F6; }
+        .assignee-pick-btn:hover:not(:disabled) { border-color: var(--tc); }
+        .assignee-pick-btn:disabled { cursor: default; opacity: 0.85; }
         .card-name { font-size: 11px; color: #9494B0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .card-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
         .card-due { font-size: 11px; color: #56566A; }
