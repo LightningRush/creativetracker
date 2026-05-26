@@ -1269,11 +1269,12 @@ function SelectSetsPage({ sets, projects, onSave, onDelete, canEdit = true }) {
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function StudioTracker() {
-  const { canEdit, isViewer, teamProfile: clerkTeamName, isLoaded } = useAppRole();
+  const { canEdit, isViewer, headerName, boardName, isLoaded } = useAppRole();
   const { user } = useUser();
-  const teamProfile = resolveTeamProfile(clerkTeamName) || clerkTeamName;
-  const actor = activityActor(teamProfile, user);
-  const showHeaderProfile = isLoaded && !!teamProfile;
+  const boardProfile = resolveTeamProfile(boardName) || boardName;
+  const headerColorName = boardProfile || resolveTeamProfile(headerName) || headerName;
+  const actor = activityActor(boardProfile, user);
+  const showHeaderProfile = isLoaded && !!headerName;
 
   useEffect(() => {
     if (user?.reload) user.reload().catch(() => {});
@@ -1387,11 +1388,11 @@ export default function StudioTracker() {
     if (!canEdit) return;
     const assignees = assigneeFilter
       ? [assigneeFilter]
-      : [defaultAssignee(teamProfile)];
+      : [defaultAssignee(boardProfile)];
     const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [] };
     const created = withActivity(null, p, actor);
     saveProjects([...projects, created], `Added "${title}"`);
-  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, teamProfile, canEdit, actor]);
+  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, boardProfile, canEdit, actor]);
 
   const handleSave = (data) => {
     if (!canEdit) return;
@@ -1926,8 +1927,8 @@ export default function StudioTracker() {
           {isViewer && <span className="sync-pill viewer">View only</span>}
           {showHeaderProfile && (
             <div className="header-profile" title="Signed in as">
-              <span className="av av-sm" style={{ background: teamColor(teamProfile) }}>{initials(teamProfile)}</span>
-              <span className="header-profile-name">{teamProfile}</span>
+              <span className="av av-sm" style={{ background: teamColor(headerColorName) }}>{initials(headerName)}</span>
+              <span className="header-profile-name">{headerName}</span>
             </div>
           )}
         </div>
@@ -2024,7 +2025,7 @@ export default function StudioTracker() {
       </main>
       )} {/* end page conditional */}
 
-      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onClose={() => setDrawer(null)} presentations={presentationProjects} readOnly={!canEdit} defaultAssigneeName={defaultAssignee(teamProfile)} />}
+      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onClose={() => setDrawer(null)} presentations={presentationProjects} readOnly={!canEdit} defaultAssigneeName={defaultAssignee(boardProfile)} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
