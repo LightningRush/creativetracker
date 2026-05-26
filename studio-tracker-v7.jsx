@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from "react";
-import { UserButton, useUser } from "@clerk/clerk-react";
+import { UserButton } from "@clerk/clerk-react";
 import { useAppRole } from "./src/useAppRole.js";
 
 const MAX_ACTIVITY = 50;
@@ -1269,16 +1269,11 @@ function SelectSetsPage({ sets, projects, onSave, onDelete, canEdit = true }) {
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function StudioTracker() {
-  const { canEdit, isViewer, headerName, boardName, isLoaded } = useAppRole();
-  const { user } = useUser();
+  const { canEdit, isViewer, headerName, boardName, user } = useAppRole();
   const boardProfile = resolveTeamProfile(boardName) || boardName;
   const headerColorName = boardProfile || resolveTeamProfile(headerName) || headerName;
   const actor = activityActor(boardProfile, user);
-  const showHeaderProfile = isLoaded && !!headerName;
-
-  useEffect(() => {
-    if (user?.reload) user.reload().catch(() => {});
-  }, [user?.id]);
+  const showHeaderProfile = !!headerName;
   const [projects,       setProjects]       = useState([]);
   const [sets,           setSets]           = useState([]);
   const [loading,        setLoading]        = useState(true);
