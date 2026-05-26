@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from "react";
 import { UserButton } from "@clerk/clerk-react";
 import { useAppRole } from "./src/useAppRole.js";
+import { useNickname } from "./src/useNickname.js";
 
 const MAX_ACTIVITY = 50;
 
@@ -414,6 +415,58 @@ function AssigneePicker({ assignees, onChange, readOnly }) {
         );
       })}
       {!readOnly && <div className="field-hint">Select everyone working on this project</div>}
+    </div>
+  );
+}
+
+// ─── HEADER NICKNAME (local, per user) ───────────────────────────────────────
+function HeaderNickname({ userId, colorName }) {
+  const { nickname, setNickname } = useNickname(userId);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const display = nickname.trim();
+  const open = () => {
+    setDraft(nickname);
+    setEditing(true);
+  };
+  const save = () => {
+    setNickname(draft);
+    setEditing(false);
+  };
+  const color = teamColor(colorName) || "#8B7FFF";
+  return (
+    <div className="header-profile-wrap">
+      <button type="button" className="header-profile" onClick={open} title="Click to set your nickname">
+        <span className="av av-sm" style={{ background: color }}>{initials(display || "?")}</span>
+        <span className={`header-profile-name ${display ? "" : "muted"}`}>
+          {display || "Add nickname"}
+        </span>
+      </button>
+      {editing && (
+        <>
+          <div className="nick-pop-backdrop" onClick={() => setEditing(false)} />
+          <div className="nick-pop">
+            <div className="nick-pop-title">Your nickname</div>
+            <input
+              className="ui-input"
+              value={draft}
+              onChange={e => setDraft(e.target.value)}
+              placeholder="e.g. Rafa"
+              autoFocus
+              maxLength={32}
+              onKeyDown={e => {
+                if (e.key === "Enter") { e.preventDefault(); save(); }
+                if (e.key === "Escape") setEditing(false);
+              }}
+            />
+            <div className="nick-pop-actions">
+              <button type="button" className="btn-primary nick-save" onClick={save}>Save</button>
+              <button type="button" className="btn-cancel" onClick={() => setEditing(false)}>Cancel</button>
+            </div>
+            <p className="nick-pop-hint">Only you see this — saved on this device</p>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1269,11 +1322,9 @@ function SelectSetsPage({ sets, projects, onSave, onDelete, canEdit = true }) {
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function StudioTracker() {
-  const { canEdit, isViewer, headerName, boardName, user } = useAppRole();
+  const { canEdit, isViewer, boardName, user, isLoaded } = useAppRole();
   const boardProfile = resolveTeamProfile(boardName) || boardName;
-  const headerColorName = boardProfile || resolveTeamProfile(headerName) || headerName;
   const actor = activityActor(boardProfile, user);
-  const showHeaderProfile = Boolean(headerName?.trim());
   const [projects,       setProjects]       = useState([]);
   const [sets,           setSets]           = useState([]);
   const [loading,        setLoading]        = useState(true);
@@ -1482,8 +1533,17 @@ export default function StudioTracker() {
           display: flex; align-items: center; justify-content: space-between;
         }
         .brand { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
-        .brand .header-profile { margin-left: 2px; }
+        .header-profile-wrap { position: relative; margin-left: 2px; }
+        .brand .header-profile { margin-left: 0; cursor: pointer; border: none; font-family: inherit; }
+        .brand .header-profile:hover { border-color: #8B7FFF55; background: #1C1C28; }
+        .header-profile-name.muted { color: #56566A; font-weight: 500; }
         .brand .header-profile-name { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .nick-pop-backdrop { position: fixed; inset: 0; z-index: 200; }
+        .nick-pop { position: absolute; top: calc(100% + 8px); left: 0; z-index: 201; min-width: 220px; padding: 14px; background: #1C1C24; border: 1px solid #2A2A36; border-radius: 12px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
+        .nick-pop-title { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #56566A; margin-bottom: 8px; }
+        .nick-pop-actions { display: flex; gap: 8px; margin-top: 10px; }
+        .nick-save { flex: 1; padding: 8px 12px; font-size: 13px; }
+        .nick-pop-hint { font-size: 11px; color: #56566A; margin: 10px 0 0; line-height: 1.4; }
         .brand-mark {
           width: 30px; height: 30px;
           background: linear-gradient(135deg, #8B7FFF, #6055CC);
@@ -1920,11 +1980,8 @@ export default function StudioTracker() {
             {window.storage?.mode === "shared" ? "Team board" : "This device only"}
           </span>
           {isViewer && <span className="sync-pill viewer">View only</span>}
-          {showHeaderProfile && (
-            <div className="header-profile" title="Signed in as">
-              <span className="av av-sm" style={{ background: teamColor(headerColorName) }}>{initials(headerName)}</span>
-              <span className="header-profile-name">{headerName}</span>
-            </div>
+          {isLoaded && user?.id && (
+            <HeaderNickname userId={user.id} colorName={boardProfile} />
           )}
         </div>
         <div className="header-right">
