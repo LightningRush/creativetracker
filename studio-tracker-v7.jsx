@@ -4,8 +4,10 @@ import { useAppRole } from "./src/useAppRole.js";
 
 const MAX_ACTIVITY = 50;
 
-const defaultAssignee = (teamProfile) =>
-  (teamProfile && TEAM.some(t => t.name === teamProfile) ? teamProfile : TEAM[0].name);
+const defaultAssignee = (teamProfile) => {
+  const resolved = resolveTeamProfile(teamProfile);
+  return resolved && TEAM.some(t => t.name === resolved) ? resolved : TEAM[0].name;
+};
 
 // ─── PALETTE ─────────────────────────────────────────────────────────────────
 const C = {
@@ -65,6 +67,23 @@ const TEAM = [
   { name: "Rafa C.",    color: "#8B7FFF" },
 ];
 const teamColor = (name) => TEAM.find(t => t.name === name)?.color || "#9494B0";
+
+/** Match Clerk teamName to board name (exact, case, or first name e.g. "Flavia" → "Flavia N.") */
+const resolveTeamProfile = (raw) => {
+  if (!raw?.trim()) return null;
+  const t = raw.trim();
+  const exact = TEAM.find(m => m.name === t);
+  if (exact) return exact.name;
+  const lower = t.toLowerCase();
+  const ci = TEAM.find(m => m.name.toLowerCase() === lower);
+  if (ci) return ci.name;
+  const first = lower.split(/\s+/)[0];
+  const fuzzy = TEAM.find(m => {
+    const mn = m.name.toLowerCase();
+    return mn === lower || mn.startsWith(`${first} `) || mn.split(" ")[0] === first;
+  });
+  return fuzzy ? fuzzy.name : t;
+};
 
 const projectAssignees = (p) => {
   if (!p) return [];
@@ -1250,9 +1269,15 @@ function SelectSetsPage({ sets, projects, onSave, onDelete, canEdit = true }) {
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function StudioTracker() {
-  const { canEdit, isViewer, teamProfile } = useAppRole();
+  const { canEdit, isViewer, teamProfile: clerkTeamName, isLoaded } = useAppRole();
   const { user } = useUser();
+  const teamProfile = resolveTeamProfile(clerkTeamName) || clerkTeamName;
   const actor = activityActor(teamProfile, user);
+  const showHeaderProfile = isLoaded && !!teamProfile;
+
+  useEffect(() => {
+    if (user?.reload) user.reload().catch(() => {});
+  }, [user?.id]);
   const [projects,       setProjects]       = useState([]);
   const [sets,           setSets]           = useState([]);
   const [loading,        setLoading]        = useState(true);
@@ -1460,7 +1485,9 @@ export default function StudioTracker() {
           padding: 0 28px; height: 58px;
           display: flex; align-items: center; justify-content: space-between;
         }
-        .brand { display: flex; align-items: center; gap: 10px; }
+        .brand { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+        .brand .header-profile { margin-left: 2px; }
+        .brand .header-profile-name { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .brand-mark {
           width: 30px; height: 30px;
           background: linear-gradient(135deg, #8B7FFF, #6055CC);
@@ -1897,6 +1924,12 @@ export default function StudioTracker() {
             {window.storage?.mode === "shared" ? "Team board" : "This device only"}
           </span>
           {isViewer && <span className="sync-pill viewer">View only</span>}
+          {showHeaderProfile && (
+            <div className="header-profile" title="Signed in as">
+              <span className="av av-sm" style={{ background: teamColor(teamProfile) }}>{initials(teamProfile)}</span>
+              <span className="header-profile-name">{teamProfile}</span>
+            </div>
+          )}
         </div>
         <div className="header-right">
           {/* Page nav */}
@@ -1913,12 +1946,6 @@ export default function StudioTracker() {
             </div>
             {canEdit && <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New</button>}
           </>}
-          {teamProfile && TEAM.some(t => t.name === teamProfile) && (
-            <div className="header-profile" title="Your team profile">
-              <span className="av av-sm" style={{ background: teamColor(teamProfile) }}>{initials(teamProfile)}</span>
-              <span className="header-profile-name">{teamProfile}</span>
-            </div>
-          )}
           <UserButton
             afterSignOutUrl="/"
             appearance={{
