@@ -1273,7 +1273,7 @@ export default function StudioTracker() {
   const boardProfile = resolveTeamProfile(boardName) || boardName;
   const headerColorName = boardProfile || resolveTeamProfile(headerName) || headerName;
   const actor = activityActor(boardProfile, user);
-  const showHeaderProfile = !!headerName;
+  const showHeaderProfile = Boolean(headerName?.trim());
   const [projects,       setProjects]       = useState([]);
   const [sets,           setSets]           = useState([]);
   const [loading,        setLoading]        = useState(true);
