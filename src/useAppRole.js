@@ -1,11 +1,50 @@
+import { useState, useEffect, useCallback } from "react";
 import { useUser } from "@clerk/clerk-react";
 
 export const OWNER_TEAM_NAME = "Rafa C.";
 
-/** Clerk publicMetadata.teamName, or owner email match (VITE_OWNER_EMAIL + VITE_OWNER_TEAM_NAME) */
-export function useTeamProfile() {
-  const { user, isLoaded } = useUser();
-  if (!isLoaded || !user) return null;
+const nicknameKey = (userId) => `st_nickname_${userId}`;
+
+export function loadNickname(userId) {
+  if (!userId) return "";
+  try {
+    return localStorage.getItem(nicknameKey(userId)) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function saveNickname(userId, name) {
+  if (!userId) return;
+  const v = name.trim();
+  try {
+    if (v) localStorage.setItem(nicknameKey(userId), v);
+    else localStorage.removeItem(nicknameKey(userId));
+  } catch {
+    /* private browsing */
+  }
+}
+
+/** Per-user nickname in header (saved on this device only) */
+export function useNickname(userId) {
+  const [nickname, setNicknameState] = useState("");
+
+  useEffect(() => {
+    setNicknameState(loadNickname(userId));
+  }, [userId]);
+
+  const setNickname = useCallback((name) => {
+    const v = typeof name === "string" ? name.trim() : "";
+    setNicknameState(v);
+    saveNickname(userId, v);
+  }, [userId]);
+
+  return { nickname, setNickname };
+}
+
+/** Optional board roster name from Clerk (assignee defaults / activity) */
+export function readBoardTeamName(user) {
+  if (!user) return null;
   const meta = user.publicMetadata?.teamName;
   if (typeof meta === "string" && meta.trim()) return meta.trim();
   const ownerEmail = import.meta.env.VITE_OWNER_EMAIL?.toLowerCase();
@@ -16,16 +55,21 @@ export function useTeamProfile() {
   return null;
 }
 
-/** Clerk publicMetadata.role: "viewer" = read-only; anything else (or unset) = can edit */
+/** Clerk publicMetadata.role: "viewer" = read-only */
 export function useAppRole() {
   const { user, isLoaded } = useUser();
-  const role = typeof user?.publicMetadata?.role === "string"
-    ? user.publicMetadata.role.toLowerCase()
-    : "editor";
-
+  const roleRaw = user?.publicMetadata?.role;
+  const role = typeof roleRaw === "string" ? roleRaw.toLowerCase() : "editor";
   const isViewer = role === "viewer";
   const canEdit = !isViewer;
-  const teamProfile = useTeamProfile();
+  const boardName = user ? readBoardTeamName(user) : null;
 
-  return { canEdit, isViewer, role, isLoaded, teamProfile };
+  return {
+    canEdit,
+    isViewer,
+    role,
+    isLoaded: isLoaded && !!user,
+    boardName,
+    user,
+  };
 }
