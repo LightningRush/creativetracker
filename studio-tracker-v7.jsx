@@ -1065,16 +1065,32 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, read
   const isPresentation = form.projectType === "presentation";
   const isAwaitingSales = !isPresentation && form.stage === "awaiting_sales";
   const stageOptions   = isPresentation ? PRES_STAGES : STAGES;
+  const [closing, setClosing] = useState(false);
+
+  const requestClose = useCallback(() => {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(() => onClose?.(), 180);
+  }, [closing, onClose]);
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") requestClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [requestClose]);
+
   return (
     <>
-      <div className="drawer-overlay" onClick={onClose} />
-      <div className="drawer">
+      <div className={`drawer-overlay ${closing ? "closing" : ""}`} onClick={requestClose} />
+      <div className={`drawer ${closing ? "closing" : ""}`}>
         <div className="drawer-handle" />
         <div className="drawer-cat-bar" style={{ background: catColor(form.category) }} />
         <div className="drawer-inner">
           <div className="drawer-head">
             <span className="eyebrow">{readOnly ? "View" : isNew ? "New" : "Edit"} {isPresentation ? "Presentation" : "Project"}</span>
-            <button onClick={onClose} className="close-btn">✕</button>
+            <button onClick={requestClose} className="close-btn">✕</button>
           </div>
 
           {isNew && !readOnly && (
@@ -1151,7 +1167,7 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, read
           </div>
           ) : (
             <div className="drawer-actions">
-              <button onClick={onClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+              <button onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
             </div>
           )}
         </div>
@@ -1174,17 +1190,32 @@ function SSDrawer({ set, isNew, onSave, onClose, onDelete, readOnly = false }) {
   const s = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const [confirmDelete, setConfirmDelete] = useState(false);
   const cust = CUSTOMERS.find(c => c.id === form.customerId);
+  const [closing, setClosing] = useState(false);
+
+  const requestClose = useCallback(() => {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(() => onClose?.(), 180);
+  }, [closing, onClose]);
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") requestClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [requestClose]);
 
   return (
     <>
-      <div className="drawer-overlay" onClick={onClose} />
-      <div className="drawer">
+      <div className={`drawer-overlay ${closing ? "closing" : ""}`} onClick={requestClose} />
+      <div className={`drawer ${closing ? "closing" : ""}`}>
         <div className="drawer-handle" />
         <div className="drawer-cat-bar" style={{ background: cust?.color || "#8B7FFF" }} />
         <div className="drawer-inner">
           <div className="drawer-head">
             <span className="eyebrow">{readOnly ? "View Select Set" : isNew ? "New Select Set" : "Edit Select Set"}</span>
-            <button onClick={onClose} className="close-btn">✕</button>
+            <button onClick={requestClose} className="close-btn">✕</button>
           </div>
           <input value={form.name} onChange={e => s("name", e.target.value)} readOnly={readOnly}
             placeholder="e.g. Costco Hydration"
@@ -1253,7 +1284,7 @@ function SSDrawer({ set, isNew, onSave, onClose, onDelete, readOnly = false }) {
           </div>
           ) : (
             <div className="drawer-actions">
-              <button onClick={onClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+              <button onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
             </div>
           )}
         </div>
@@ -1431,11 +1462,26 @@ function LicensingDrawer({
   const canEditRequestedSkus = !readOnly && (!canResolve || canCreate);
   const canEditArtSkus = !readOnly && canResolve;
   const artSkuEntries = normalizeStyleEntries(form.styleNumbers);
+  const [closing, setClosing] = useState(false);
+
+  const requestClose = useCallback(() => {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(() => onClose?.(), 180);
+  }, [closing, onClose]);
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") requestClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [requestClose]);
 
   return (
     <>
-      <div className="drawer-overlay" onClick={onClose} />
-      <div className="drawer">
+      <div className={`drawer-overlay ${closing ? "closing" : ""}`} onClick={requestClose} />
+      <div className={`drawer ${closing ? "closing" : ""}`}>
         <div className="drawer-handle" />
         <div className="drawer-cat-bar" style={{ background: type.dot }} />
         <div className="drawer-inner">
@@ -1443,7 +1489,7 @@ function LicensingDrawer({
             <span className="eyebrow">
               {readOnly ? "View" : isNew ? "New" : "Edit"} Licensing Request
             </span>
-            <button onClick={onClose} className="close-btn">✕</button>
+            <button onClick={requestClose} className="close-btn">✕</button>
           </div>
 
           <div className="field-grid lic-drawer-sections">
@@ -1564,7 +1610,7 @@ function LicensingDrawer({
             </div>
           ) : (
             <div className="drawer-actions">
-              <button onClick={onClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+              <button onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
             </div>
           )}
         </div>
@@ -1726,7 +1772,16 @@ export default function StudioTracker() {
     }
   })();
   const [loading,        setLoading]        = useState(true);
-  const [page,           setPage]           = useState("projects"); // "projects" | "selectsets" | "licensing"
+  const pageKey = user?.id ? `st_page_${user.id}` : "st_page";
+  const [page, setPage] = useState(() => {
+    try {
+      const v = localStorage.getItem(pageKey);
+      if (v === "projects" || v === "selectsets" || v === "licensing") return v;
+    } catch {
+      /* ignore */
+    }
+    return "projects";
+  }); // "projects" | "selectsets" | "licensing"
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [assigneeFilter, setAssigneeFilter] = useState(null);
   const [search,         setSearch]         = useState("");
@@ -1883,6 +1938,14 @@ export default function StudioTracker() {
       /* ignore */
     }
   }, [page, hasLicensingAccess, licSeenKey]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(pageKey, page);
+    } catch {
+      /* ignore */
+    }
+  }, [pageKey, page]);
   const catPool = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const asnOk  = !assigneeFilter || projectHasAssignee(p, assigneeFilter);
@@ -2217,10 +2280,15 @@ export default function StudioTracker() {
         .list-empty { padding: 60px 40px; text-align: center; color: #3A3A50; font-size: 14px; }
 
         /* ── DRAWER ── */
-        .drawer-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); z-index: 200; }
+        .drawer-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); z-index: 200; animation: fadeIn 0.18s ease-out; }
+        .drawer-overlay.closing { animation: fadeOut 0.18s ease-in forwards; }
         .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 100%; max-width: 460px; background: #14141A; border-left: 1px solid #2A2A36; z-index: 201; overflow-y: auto; display: flex; flex-direction: column; animation: slideInRight 0.25s ease-out; }
+        .drawer.closing { animation: slideOutRight 0.18s ease-in forwards; }
         @keyframes slideInRight { from { transform: translateX(100%); } to { transform: translateX(0); } }
+        @keyframes slideOutRight { from { transform: translateX(0); } to { transform: translateX(100%); } }
         @keyframes slideInUp    { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
         .drawer-handle { display: none; flex-shrink: 0; }
         .drawer-cat-bar { height: 4px; width: 100%; flex-shrink: 0; }
         .drawer-inner { padding: 22px 28px 36px; flex: 1; overflow-y: auto; }
@@ -2480,6 +2548,8 @@ export default function StudioTracker() {
           .list-assignee { grid-column: 2; grid-row: 2; padding: 0 16px 12px 14px; }
           .list-due { grid-column: 3; grid-row: 2; align-self: center; padding: 0 16px 12px 0; text-align: right; }
           .drawer { top: auto; left: 0; right: 0; bottom: 0; max-width: 100%; border-left: none; border-top: 1px solid #2A2A36; border-top-left-radius: 18px; border-top-right-radius: 18px; max-height: 92vh; animation: slideInUp 0.28s ease-out; }
+          .drawer.closing { animation: slideOutDown 0.18s ease-in forwards; }
+          @keyframes slideOutDown { from { transform: translateY(0); } to { transform: translateY(100%); } }
           .drawer-handle { display: flex; width: 36px; height: 4px; background: #2A2A36; border-radius: 2px; margin: 10px auto 0; }
           .drawer-inner { padding: 16px 20px max(28px, env(safe-area-inset-bottom)); }
           .drawer-title { font-size: 18px; }
