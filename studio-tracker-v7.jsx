@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from "react";
 import { UserButton } from "@clerk/clerk-react";
-import { useAppRole } from "./src/useAppRole.js";
-import { useNickname } from "./src/useNickname.js";
+import { useAppRole, useNickname } from "./src/useAppRole.js";
 
 const MAX_ACTIVITY = 50;
 
@@ -251,6 +250,66 @@ function withActivity(prev, next, by) {
   return { ...next, activity };
 }
 
+function diffLicActivity(prev, next, by, projects) {
+  if (!prev) return [newActivityEntry(by, "Created request")];
+  const entries = [];
+
+  const prevType = prev.type || "general";
+  const nextType = next.type || "general";
+  if (prevType !== nextType) {
+    entries.push(newActivityEntry(by, `Type → ${licTypeOf(nextType).label}`));
+  }
+
+  const prevStatus = prev.status || "open";
+  const nextStatus = next.status || "open";
+  if (prevStatus !== nextStatus) {
+    entries.push(newActivityEntry(by, nextStatus === "done" ? "Marked done" : "Reopened"));
+  }
+
+  const prevProjectId = prev.projectId || "";
+  const nextProjectId = next.projectId || "";
+  if (prevProjectId !== nextProjectId) {
+    const title = nextProjectId ? (projects?.find(p => p.id === nextProjectId)?.title || "a project") : "";
+    entries.push(newActivityEntry(by, nextProjectId ? `Linked to ${title}` : "Unlinked project"));
+  }
+
+  if ((prev.skuText || "").trim() !== (next.skuText || "").trim()) {
+    entries.push(newActivityEntry(by, "Updated requested SKU(s)"));
+  }
+
+  const prevArtSku = skuLabels({ styleNumbers: prev.styleNumbers }).join("|");
+  const nextArtSku = skuLabels({ styleNumbers: next.styleNumbers }).join("|");
+  if (prevArtSku !== nextArtSku) {
+    const prevSet = new Set(skuLabels({ styleNumbers: prev.styleNumbers }));
+    const nextSet = new Set(skuLabels({ styleNumbers: next.styleNumbers }));
+    const added = skuLabels({ styleNumbers: next.styleNumbers }).filter(l => !prevSet.has(l));
+    const removed = skuLabels({ styleNumbers: prev.styleNumbers }).filter(l => !nextSet.has(l));
+    if (added.length) {
+      entries.push(newActivityEntry(by, `Art added SKU${added.length > 1 ? "s" : ""}: ${added.join(", ")}`));
+    }
+    if (removed.length) {
+      entries.push(newActivityEntry(by, `Art removed SKU${removed.length > 1 ? "s" : ""}: ${removed.join(", ")}`));
+    }
+  }
+
+  if ((prev.message || "").trim() !== (next.message || "").trim()) {
+    entries.push(newActivityEntry(by, "Updated request message"));
+  }
+
+  if ((prev.resolutionNote || "").trim() !== (next.resolutionNote || "").trim()) {
+    entries.push(newActivityEntry(by, "Updated resolution note"));
+  }
+
+  return entries;
+}
+
+function withLicActivity(prev, next, by, projects) {
+  const added = diffLicActivity(prev, next, by, projects);
+  if (!added.length) return next;
+  const activity = [...added, ...(next.activity || prev?.activity || [])].slice(0, MAX_ACTIVITY);
+  return { ...next, activity };
+}
+
 const LINK_MARKDOWN_RE = /\[([^\]]+)\]\(([^)]+)\)|(https?:\/\/[^\s<>"{}|\\^`[\]]+)/g;
 
 function LinkedText({ text, className = "" }) {
@@ -273,7 +332,7 @@ function LinkedText({ text, className = "" }) {
   return <span className={`linked-text ${className}`.trim()}>{nodes}</span>;
 }
 
-function StyleSkuSection({ value, onChange, canEdit }) {
+function StyleSkuSection({ value, onChange, canEdit, label = "Style numbers", emptyHint = "Add SKUs with Centric links below" }) {
   const entries = normalizeStyleEntries(value);
   const [draftLabel, setDraftLabel] = useState("");
   const [draftUrl, setDraftUrl] = useState("");
@@ -292,7 +351,7 @@ function StyleSkuSection({ value, onChange, canEdit }) {
   if (!canEdit && !entries.length) return null;
   return (
     <div className="sku-below-comments">
-      <div className="field-label">Style numbers</div>
+      <div className="field-label">{label}</div>
       {entries.length > 0 ? (
         <ul className="sku-link-list">
           {entries.map((e, i) => (
@@ -306,7 +365,7 @@ function StyleSkuSection({ value, onChange, canEdit }) {
           ))}
         </ul>
       ) : canEdit ? (
-        <div className="sku-empty-hint">Add SKUs with Centric links below</div>
+        <div className="sku-empty-hint">{emptyHint}</div>
       ) : null}
       {canEdit && (
         <div className="sku-add-row">
@@ -368,6 +427,17 @@ const SS_STATUS = [
 const ssStatusOf = (id) => SS_STATUS.find(s => s.id === id) || SS_STATUS[0];
 async function loadSS() { try { const r = await window.storage.get("ss_v1"); return r ? JSON.parse(r.value) : []; } catch { return []; } }
 async function saveSS(s) { await window.storage.set("ss_v1", JSON.stringify(s)); }
+
+// ─── LICENSING REQUESTS ───────────────────────────────────────────────────────
+const LIC_TYPES = [
+  { id: "resubmit_sku", label: "Resubmit SKU", dot: "#FBBF24" },
+  { id: "new_sku",      label: "New SKU",      dot: "#60A5FA" },
+  { id: "general",      label: "General",      dot: "#8B7FFF" },
+];
+const licTypeOf = (id) => LIC_TYPES.find(t => t.id === id) || LIC_TYPES[0];
+
+async function loadLic() { try { const r = await window.storage.get("lic_v1"); return r ? JSON.parse(r.value) : []; } catch { return []; } }
+async function saveLic(reqs) { await window.storage.set("lic_v1", JSON.stringify(reqs)); }
 
 function AssigneeAvatars({ project, size = "sm", maxShow = 3, compact = false }) {
   const names = projectAssignees(project);
@@ -1320,15 +1390,343 @@ function SelectSetsPage({ sets, projects, onSave, onDelete, canEdit = true }) {
   );
 }
 
+// ─── LICENSING PAGE ───────────────────────────────────────────────────────────
+function LicensingDrawer({
+  req,
+  isNew,
+  onSave,
+  onClose,
+  onDelete,
+  readOnly = false,
+  canCreate = false,
+  canResolve = false,
+  projects = [],
+}) {
+  const [form, setForm] = useState(() => {
+    const base = req || {
+      id: "",
+      createdAt: "",
+      updatedAt: "",
+      createdBy: "",
+      status: "open",
+      type: "resubmit_sku",
+      projectId: "",
+      skuText: "",
+      styleNumbers: [],
+      message: "",
+      resolutionNote: "",
+    };
+    return {
+      ...base,
+      styleNumbers: normalizeStyleEntries(base.styleNumbers),
+      skuText: base.skuText || "",
+    };
+  });
+  const s = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const linkedProject = form.projectId ? projects.find(p => p.id === form.projectId) : null;
+  const type = licTypeOf(form.type);
+  const activity = form.activity || req?.activity || [];
+  const canEditRequestedSkus = !readOnly && (!canResolve || canCreate);
+  const canEditArtSkus = !readOnly && canResolve;
+  const artSkuEntries = normalizeStyleEntries(form.styleNumbers);
+
+  return (
+    <>
+      <div className="drawer-overlay" onClick={onClose} />
+      <div className="drawer">
+        <div className="drawer-handle" />
+        <div className="drawer-cat-bar" style={{ background: type.dot }} />
+        <div className="drawer-inner">
+          <div className="drawer-head">
+            <span className="eyebrow">
+              {readOnly ? "View" : isNew ? "New" : "Edit"} Licensing Request
+            </span>
+            <button onClick={onClose} className="close-btn">✕</button>
+          </div>
+
+          <div className="field-grid lic-drawer-sections">
+            <div className="lic-section-head">Licensing</div>
+
+            <Field label="Type" full>
+              <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                {LIC_TYPES.map(t => (
+                  <button key={t.id} type="button" disabled={!canEditRequestedSkus}
+                    onClick={() => canEditRequestedSkus && s("type", t.id)}
+                    className={`ss-status-btn ${form.type === t.id ? "ss-status-active" : ""}`}>
+                    <span className="ss-dot" style={{ background: t.dot }} />{t.label}
+                  </button>
+                ))}
+              </div>
+            </Field>
+
+            <Field label="Linked project (optional)" full>
+              <Select value={form.projectId || ""} disabled={!canEditRequestedSkus}
+                onChange={e => s("projectId", e.target.value)}>
+                <option value="">None</option>
+                {projects
+                  .filter(p => p.stage !== "archived")
+                  .map(p => <option key={p.id} value={p.id}>{p.title}</option>)}
+              </Select>
+              {linkedProject && (
+                <div className="field-hint">Linked to: {linkedProject.title}</div>
+              )}
+            </Field>
+
+            <Field label="Request" full>
+              <Textarea rows={4} value={form.message || ""} disabled={!canEditRequestedSkus}
+                onChange={e => s("message", e.target.value)}
+                placeholder="What does Licensing need from Art?" />
+              {!canEditRequestedSkus && <div className="field-hint">From Licensing — read only</div>}
+            </Field>
+
+            {(canEditRequestedSkus || (form.skuText || "").trim()) && (
+              <Field label="Requested SKU(s)" full>
+                <Textarea rows={3} value={form.skuText || ""} disabled={!canEditRequestedSkus}
+                  onChange={e => s("skuText", e.target.value)}
+                  placeholder={"One SKU per line\nExample: ABC-123\nXYZ-987"} />
+                {!canEditRequestedSkus && <div className="field-hint">From Licensing — read only</div>}
+              </Field>
+            )}
+
+            {(!isNew || canResolve || (form.resolutionNote || "").trim() || artSkuEntries.length > 0) && (
+              <>
+                <div className="lic-section-head art">Art team</div>
+
+                <Field label="Resolution note" full>
+                  <Textarea rows={3} value={form.resolutionNote || ""} disabled={readOnly || !canResolve}
+                    onChange={e => s("resolutionNote", e.target.value)}
+                    placeholder="What was changed / what was resubmitted" />
+                  {!canResolve && <div className="field-hint">Art completes this when closing the request</div>}
+                </Field>
+
+                {(canEditArtSkus || artSkuEntries.length > 0) && (
+                  <div className="field field-full">
+                    <StyleSkuSection
+                      value={form.styleNumbers}
+                      onChange={v => s("styleNumbers", v)}
+                      canEdit={canEditArtSkus}
+                      label="SKUs with links"
+                      emptyHint="Add SKU + Centric link (optional)"
+                    />
+                    {!canEditArtSkus && <div className="field-hint">Added by Art when completing the request</div>}
+                  </div>
+                )}
+
+                <Field label="Status" full>
+                  <div className="lic-status-row">
+                    <span className={`lic-status-pill ${form.status === "done" ? "done" : "open"}`}>
+                      {form.status === "done" ? "Done" : "Open"}
+                    </span>
+                    <span className="mono">
+                      {form.createdBy ? `${form.createdBy} · ` : ""}{form.createdAt ? formatActivityTime(form.createdAt) : ""}
+                    </span>
+                  </div>
+                  {!readOnly && canResolve && (
+                    <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginTop:8 }}>
+                      {form.status !== "done" ? (
+                        <button type="button" className="btn-primary" onClick={() => s("status", "done")}>Mark done</button>
+                      ) : (
+                        <button type="button" className="btn-cancel" onClick={() => s("status", "open")}>Reopen</button>
+                      )}
+                    </div>
+                  )}
+                </Field>
+              </>
+            )}
+          </div>
+
+          {!isNew && <ActivityLog activity={activity} />}
+
+          {!readOnly ? (
+            <div className="drawer-actions">
+              <button
+                onClick={() => onSave({
+                  ...form,
+                  id: form.id || `lic${Date.now()}`,
+                  status: form.status === "done" ? "done" : "open",
+                  styleNumbers: normalizeStyleEntries(form.styleNumbers),
+                })}
+                disabled={!String(form.message || "").trim()}
+                className="btn-primary"
+              >
+                {isNew ? "Create request" : "Save changes"}
+              </button>
+              {!isNew && (
+                confirmDelete
+                  ? <div style={{ display:"flex", gap:8, flex:1 }}>
+                      <button onClick={() => onDelete(form.id)} className="btn-danger" style={{ flex:1 }}>Yes, delete</button>
+                      <button onClick={() => setConfirmDelete(false)} className="btn-cancel">Cancel</button>
+                    </div>
+                  : <button onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
+              )}
+            </div>
+          ) : (
+            <div className="drawer-actions">
+              <button onClick={onClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function LicensingPage({
+  requests,
+  projects,
+  onSave,
+  onDelete,
+  canCreate = false,
+  canEdit = false,
+  canResolve = false,
+}) {
+  const [statusTab, setStatusTab] = useState("open"); // "open" | "done"
+  const [search, setSearch] = useState("");
+  const [drawer, setDrawer] = useState(null); // { isNew, req }
+
+  const norm = (v) => (v || "").toString().toLowerCase();
+  const q = norm(search).trim();
+  const projTitle = (id) => projects.find(p => p.id === id)?.title || "";
+
+  const openCount = requests.filter(r => (r.status || "open") !== "done").length;
+  const doneCount = requests.filter(r => (r.status || "open") === "done").length;
+  const typeCounts = LIC_TYPES.reduce((a, t) => {
+    a[t.id] = (requests || []).filter(r => (r.status || "open") !== "done" && (r.type || "general") === t.id).length;
+    return a;
+  }, {});
+
+  const visible = (requests || [])
+    .slice()
+    .sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))
+    .filter(r => (statusTab === "done" ? (r.status === "done") : (r.status !== "done")))
+    .filter(r => {
+      if (!q) return true;
+      return (
+        norm(r.skuText).includes(q) ||
+        styleNumbersOf({ styleNumbers: r.styleNumbers }).some(s => norm(s).includes(q)) ||
+        norm(r.message).includes(q) ||
+        norm(r.type).includes(q) ||
+        norm(projTitle(r.projectId)).includes(q)
+      );
+    });
+
+  return (
+    <div className="lic-page">
+      <div className="ss-topbar">
+        <div>
+          <h1 className="page-title">Licensing Requests</h1>
+          <p className="page-sub">{openCount} open · {doneCount} done</p>
+        </div>
+        <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+          <input value={search} onChange={e => setSearch(e.target.value)}
+            placeholder="Search SKUs, requests, project…" className="ss-search" />
+          {canCreate && <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New Request</button>}
+        </div>
+      </div>
+
+      <div className="stats-bar">
+        <div className="stat" style={{ borderColor: "rgba(251,191,36,0.25)" }}>
+          <div><div className="stat-val" style={{ color: C.amber }}>{openCount}</div><div className="stat-label">Open</div></div>
+        </div>
+        <div className="stat" style={{ borderColor: "rgba(52,211,153,0.25)" }}>
+          <div><div className="stat-val" style={{ color: C.green }}>{doneCount}</div><div className="stat-label">Done</div></div>
+        </div>
+        {LIC_TYPES.map(t => (
+          <div key={t.id} className="stat" style={{ borderColor: "rgba(148,148,176,0.18)" }}>
+            <div><div className="stat-val" style={{ color: t.dot }}>{typeCounts[t.id] || 0}</div><div className="stat-label">{t.label}</div></div>
+          </div>
+        ))}
+      </div>
+
+      <div className="ss-cust-tabs">
+        <button onClick={() => setStatusTab("open")} className={`ss-ctab ${statusTab === "open" ? "active" : ""}`}>
+          Open <span className="tab-ct">{openCount}</span>
+        </button>
+        <button onClick={() => setStatusTab("done")} className={`ss-ctab ${statusTab === "done" ? "active" : ""}`}>
+          Done <span className="tab-ct">{doneCount}</span>
+        </button>
+      </div>
+
+      {visible.length === 0 ? (
+        <div className="ss-zero" style={{ paddingTop: 64 }}>
+          <div className="ss-zero-icon">◈</div>
+          <div className="ss-zero-title">No requests found</div>
+          <div className="ss-zero-sub">{search.trim() ? "Try a different search." : "Create your first request to track SKU resubmissions and notes."}</div>
+          {canCreate && <button onClick={() => setDrawer({ isNew: true })} className="btn-new" style={{ marginTop:16 }}>+ New Request</button>}
+        </div>
+      ) : (
+        <div className="lic-grid">
+          {visible.map(r => {
+            const t = licTypeOf(r.type);
+            const linked = r.projectId ? projects.find(p => p.id === r.projectId) : null;
+            const editable = canEdit;
+            return (
+              <div key={r.id} className="lic-card" onClick={() => setDrawer({ isNew: false, req: r })}>
+                <div className="lic-card-top">
+                  <div style={{ display:"flex", alignItems:"center", gap:8, minWidth:0 }}>
+                    <span className="ss-dot" style={{ background: t.dot }} />
+                    <span className="lic-type">{t.label}</span>
+                    <span className={`lic-status-pill ${r.status === "done" ? "done" : "open"}`}>
+                      {r.status === "done" ? "Done" : "Open"}
+                    </span>
+                  </div>
+                  <div className="lic-meta">{r.createdBy || "Team member"} · {formatActivityTime(r.updatedAt || r.createdAt)}</div>
+                </div>
+                {linked && <div className="lic-linked">Project: <span className="lic-linked-title">{linked.title}</span></div>}
+                {r.message?.trim() && <div className="lic-msg">{r.message.trim()}</div>}
+                {r.skuText?.trim() && <div className="lic-skus"><span className="lic-skus-label">Requested</span><pre className="lic-skus-pre">{r.skuText.trim()}</pre></div>}
+                <StyleSkuCardLinks numbers={r.styleNumbers} max={4} />
+                {!editable && <div className="field-hint" style={{ marginTop: 10 }}>View only</div>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {drawer && (
+        <LicensingDrawer
+          req={drawer.req}
+          isNew={drawer.isNew}
+          onSave={(data) => { onSave(data); setDrawer(null); }}
+          onDelete={(id) => { onDelete(id); setDrawer(null); }}
+          onClose={() => setDrawer(null)}
+          readOnly={!canEdit}
+          canCreate={canCreate}
+          canResolve={canResolve}
+          projects={projects}
+        />
+      )}
+    </div>
+  );
+}
+
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function StudioTracker() {
-  const { canEdit, isViewer, boardName, user, isLoaded } = useAppRole();
+  const { canEdit, isViewer, isLicensingTeam, hasLicensingAccess, boardName, user, isLoaded } = useAppRole();
   const boardProfile = resolveTeamProfile(boardName) || boardName;
   const actor = activityActor(boardProfile, user);
+  const canEditProjects = canEdit && !isLicensingTeam;
+  const canEditSelectSets = canEdit && !isLicensingTeam;
+  const canEditLicensing = canEdit;
+  const canCreateLicensing = canEdit && hasLicensingAccess;
+  const canResolveLicensing = canEdit && !isLicensingTeam;
   const [projects,       setProjects]       = useState([]);
   const [sets,           setSets]           = useState([]);
+  const [licRequests,    setLicRequests]    = useState([]);
+  const licSeenKey = user?.id ? `lic_seen_${user.id}` : null;
+  const licSeenAt = (() => {
+    if (!licSeenKey) return 0;
+    try {
+      const v = localStorage.getItem(licSeenKey);
+      return v ? Date.parse(v) || 0 : 0;
+    } catch {
+      return 0;
+    }
+  })();
   const [loading,        setLoading]        = useState(true);
-  const [page,           setPage]           = useState("projects"); // "projects" | "selectsets"
+  const [page,           setPage]           = useState("projects"); // "projects" | "selectsets" | "licensing"
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [assigneeFilter, setAssigneeFilter] = useState(null);
   const [search,         setSearch]         = useState("");
@@ -1344,10 +1742,11 @@ export default function StudioTracker() {
     (async () => {
       try {
         if (window.storage.migrate) await window.storage.migrate();
-        const [p, s] = await Promise.all([load(), loadSS()]);
+        const [p, s, l] = await Promise.all([load(), loadSS(), loadLic()]);
         if (!active) return;
         setProjects(p);
         setSets(s);
+        setLicRequests(Array.isArray(l) ? l : []);
       } catch (e) {
         console.error("Failed to load team data:", e);
         if (active) flash("Could not load team board — check Supabase settings");
@@ -1374,11 +1773,16 @@ export default function StudioTracker() {
       window.storage.subscribe?.("ss_v1", (value) => applyRemote(setSets, value)) ??
       (() => {});
 
+    const unsubLic =
+      window.storage.subscribe?.("lic_v1", (value) => applyRemote(setLicRequests, value)) ??
+      (() => {});
+
     const reloadFromCloud = () => {
-      Promise.all([load(), loadSS()]).then(([p, s]) => {
+      Promise.all([load(), loadSS(), loadLic()]).then(([p, s, l]) => {
         if (!active) return;
         setProjects(p);
         setSets(s);
+        setLicRequests(Array.isArray(l) ? l : []);
       }).catch(() => {});
     };
 
@@ -1391,6 +1795,7 @@ export default function StudioTracker() {
       active = false;
       unsubProjects();
       unsubSets();
+      unsubLic();
       window.removeEventListener("focus", reloadFromCloud);
     };
   }, []);
@@ -1407,7 +1812,7 @@ export default function StudioTracker() {
   }, []);
 
   const handleAssign = useCallback((id, name) => {
-    if (!canEdit) return;
+    if (!canEditProjects) return;
     const proj = projects.find(p => p.id === id);
     if (!proj) return;
     const current = projectAssignees(proj);
@@ -1416,10 +1821,10 @@ export default function StudioTracker() {
     const updated = withActivity(proj, normalizeProjectForSave({ ...proj, assignees }), actor);
     const next = projects.map(p => p.id === id ? updated : p);
     saveProjects(next, `Added ${name} to "${proj.title}"`);
-  }, [projects, saveProjects, actor, canEdit]);
+  }, [projects, saveProjects, actor, canEditProjects]);
 
   const handleReorder = useCallback((id, newStage, beforeId) => {
-    if (!canEdit) return;
+    if (!canEditProjects) return;
     const proj = projects.find(p => p.id === id);
     if (!proj) return;
     let next = projects.filter(p => p.id !== id);
@@ -1428,20 +1833,20 @@ export default function StudioTracker() {
     else { const idxs = next.map((p, i) => p.stage === newStage ? i : -1).filter(i => i >= 0); next.splice(idxs.length ? idxs[idxs.length - 1] + 1 : next.length, 0, updated); }
     const msg = proj.stage !== newStage ? `Moved to ${stageOf(newStage).label}` : null;
     saveProjects(next, msg);
-  }, [projects, saveProjects, actor, canEdit]);
+  }, [projects, saveProjects, actor, canEditProjects]);
 
   const handleQuickAdd = useCallback((stageId, title) => {
-    if (!canEdit) return;
+    if (!canEditProjects) return;
     const assignees = assigneeFilter
       ? [assigneeFilter]
       : [defaultAssignee(boardProfile)];
     const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [] };
     const created = withActivity(null, p, actor);
     saveProjects([...projects, created], `Added "${title}"`);
-  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, boardProfile, canEdit, actor]);
+  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, boardProfile, canEditProjects, actor]);
 
   const handleSave = (data) => {
-    if (!canEdit) return;
+    if (!canEditProjects) return;
     const exists = projects.some(p => p.id === data.id);
     const prev = exists ? projects.find(p => p.id === data.id) : null;
     const payload = normalizeProjectForSave({
@@ -1454,12 +1859,30 @@ export default function StudioTracker() {
     setDrawer(null);
   };
   const handleDelete = (id) => {
-    if (!canEdit) return;
+    if (!canEditProjects) return;
     saveProjects(projects.filter(p => p.id !== id));
     setDrawer(null);
   };
 
   const presentationProjects = projects.filter(p => p.projectType === "presentation");
+  const licOpenCount = (licRequests || []).filter(r => (r?.status || "open") !== "done").length;
+  const licDoneUpdatedCount = (licRequests || []).filter(r => {
+    if (!r) return false;
+    if ((r.status || "open") !== "done") return false;
+    const t = Date.parse(r.updatedAt || r.createdAt || "") || 0;
+    return t > licSeenAt;
+  }).length;
+
+  useEffect(() => {
+    if (page !== "licensing") return;
+    if (!hasLicensingAccess) return;
+    if (!licSeenKey) return;
+    try {
+      localStorage.setItem(licSeenKey, new Date().toISOString());
+    } catch {
+      /* ignore */
+    }
+  }, [page, hasLicensingAccess, licSeenKey]);
   const catPool = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const asnOk  = !assigneeFilter || projectHasAssignee(p, assigneeFilter);
@@ -1488,7 +1911,7 @@ export default function StudioTracker() {
   const overdueCount  = visibleNonArchived.filter(p => { const d = daysUntil(p.dueDate); return d !== null && d < 0; }).length;
 
   const handleSSave = (data) => {
-    if (!canEdit) return;
+    if (!canEditSelectSets) return;
     setSets(prev => {
       const exists = prev.some(s => s.id === data.id);
       const next = exists ? prev.map(s => s.id === data.id ? data : s) : [data, ...prev];
@@ -1496,8 +1919,41 @@ export default function StudioTracker() {
     });
   };
   const handleSDelete = (id) => {
-    if (!canEdit) return;
+    if (!canEditSelectSets) return;
     setSets(prev => { const next = prev.filter(s => s.id !== id); saveSS(next); return next; });
+  };
+
+  const handleLicSave = (data) => {
+    if (!canEditLicensing) return;
+    setLicRequests(prev => {
+      const now = new Date().toISOString();
+      const exists = prev.some(r => r.id === data.id);
+      const prevRow = exists ? prev.find(r => r.id === data.id) : null;
+      const createdAt = exists ? (prevRow?.createdAt || now) : (data.createdAt || now);
+      const basePreActivity = {
+        ...data,
+        createdAt,
+        updatedAt: now,
+        status: data.status === "done" ? "done" : "open",
+      };
+      const payload = {
+        ...basePreActivity,
+        styleNumbers: normalizeStyleEntries(basePreActivity.styleNumbers),
+      };
+      const base = withLicActivity(prevRow, payload, actor, projects);
+      const next = exists ? prev.map(r => r.id === data.id ? base : r) : [base, ...prev];
+      saveLic(next);
+      return next;
+    });
+  };
+
+  const handleLicDelete = (id) => {
+    if (!canEditLicensing) return;
+    setLicRequests(prev => {
+      const next = prev.filter(r => r.id !== id);
+      saveLic(next);
+      return next;
+    });
   };
 
   if (loading) return <div style={{ minHeight:"100vh", background:"#0C0C10", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"Open Sans,sans-serif", color:"#56566A" }}>Loading…</div>;
@@ -1561,15 +2017,18 @@ export default function StudioTracker() {
         .sync-pill.local {
           background: rgba(251,191,36,0.12); color: #FBBF24; border-color: rgba(251,191,36,0.35);
         }
-        .header-right { display: flex; align-items: center; gap: 10px; }
+        .nav-center {
+          position: absolute;
+          left: 50%;
+          transform: translateX(-50%);
+          display: flex;
+          justify-content: center;
+          pointer-events: none;
+        }
+        .nav-center > * { pointer-events: auto; }
+        .header-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
         .header-profile { display: flex; align-items: center; gap: 8px; padding: 4px 10px 4px 4px; border-radius: 20px; background: #1C1C24; border: 1px solid #2A2A36; }
         .header-profile-name { font-size: 12px; font-weight: 500; color: #F0F0F6; }
-        .search-input {
-          width: 200px; background: #14141A; border: 1px solid #2A2A36;
-          border-radius: 8px; padding: 8px 12px; font-size: 13px;
-          color: #F0F0F6; outline: none; font-family: inherit; transition: border-color 0.15s;
-        }
-        .search-input:focus { border-color: #8B7FFF; }
         .view-toggle { display: flex; gap: 2px; background: #14141A; border: 1px solid #2A2A36; border-radius: 8px; padding: 3px; }
         .view-btn { padding: 6px 12px; font-size: 12px; font-weight: 600; background: transparent; border: none; border-radius: 6px; color: #56566A; cursor: pointer; font-family: inherit; transition: all 0.15s; }
         .view-btn.active { background: #23232D; color: #F0F0F6; }
@@ -1882,6 +2341,25 @@ export default function StudioTracker() {
         .page-nav-btn { padding: 6px 14px; font-size: 12px; font-weight: 600; background: transparent; border: none; border-radius: 6px; color: #56566A; cursor: pointer; font-family: inherit; transition: all 0.15s; white-space: nowrap; }
         .page-nav-btn.active { background: #23232D; color: #F0F0F6; }
         .page-nav-btn:hover:not(.active) { color: #9494B0; }
+        .nav-badge {
+          margin-left: 8px;
+          display: inline-flex; align-items: center; justify-content: center;
+          min-width: 18px; height: 18px; padding: 0 6px;
+          border-radius: 999px;
+          font-size: 10px; font-weight: 800;
+          background: rgba(251,191,36,0.12);
+          border: 1px solid rgba(251,191,36,0.30);
+          color: #FBBF24;
+        }
+        .nav-dot {
+          width: 8px; height: 8px;
+          border-radius: 50%;
+          background: rgba(52,211,153,0.95);
+          box-shadow: 0 0 0 2px rgba(12,12,16,0.92);
+          display: inline-block;
+          margin-left: 6px;
+          vertical-align: middle;
+        }
 
         /* ── SELECT SETS PAGE ── */
         .ss-page { display: flex; flex-direction: column; gap: 20px; }
@@ -1936,20 +2414,63 @@ export default function StudioTracker() {
         .ss-status-active { background: #23232D !important; color: #F0F0F6 !important; border-color: #3A3A50 !important; }
         .ss-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 
+        /* ── LICENSING REQUESTS ── */
+        .lic-page { display: flex; flex-direction: column; gap: 20px; }
+        .lic-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 10px; }
+        .lic-card {
+          background: #14141A; border: 1px solid #2A2A36; border-radius: 12px;
+          padding: 16px; display: flex; flex-direction: column; gap: 10px;
+          cursor: pointer; transition: border-color 0.15s;
+        }
+        .lic-card:hover { border-color: #3A3A50; }
+        .lic-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+        .lic-type { font-size: 12px; font-weight: 700; color: #F0F0F6; white-space: nowrap; }
+        .lic-meta { font-size: 11px; color: #56566A; white-space: nowrap; flex-shrink: 0; }
+        .lic-status-pill {
+          display: inline-flex; align-items: center;
+          padding: 2px 8px; border-radius: 999px;
+          font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
+          border: 1px solid #2A2A36; color: #9494B0; background: #1C1C24;
+        }
+        .lic-status-pill.open { border-color: rgba(251,191,36,0.25); color: #FBBF24; background: rgba(251,191,36,0.10); }
+        .lic-status-pill.done { border-color: rgba(52,211,153,0.25); color: #34D399; background: rgba(52,211,153,0.10); }
+        .lic-linked { font-size: 12px; color: #56566A; }
+        .lic-linked-title { color: #F0F0F6; font-weight: 600; }
+        .lic-msg { font-size: 12px; color: #9494B0; line-height: 1.5; }
+        .lic-skus { background: #1C1C24; border: 1px solid #2A2A36; border-radius: 10px; padding: 10px 12px; }
+        .lic-skus-label { display: block; font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #56566A; margin-bottom: 6px; }
+        .lic-skus-pre { margin: 0; white-space: pre-wrap; font-size: 11px; color: #F0F0F6; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+        .lic-drawer-sections { gap: 14px; }
+        .lic-section-head {
+          grid-column: 1 / -1;
+          font-size: 10px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase;
+          color: #FBBF24; margin: 4px 0 2px; padding-top: 14px; border-top: 1px solid #2A2A36;
+        }
+        .lic-section-head:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+        .lic-section-head.art { color: #8B7FFF; }
+        .lic-status-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+
         /* ── TOAST ── */
         .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #23232D; border: 1px solid #2A2A36; color: #F0F0F6; padding: 10px 18px; border-radius: 100px; font-size: 13px; font-weight: 500; box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 9998; animation: ti 0.2s ease-out; white-space: nowrap; }
         @keyframes ti { from { opacity:0; transform:translate(-50%,6px); } to { opacity:1; transform:translate(-50%,0); } }
 
         /* ── MOBILE ── */
+        @media (max-width: 900px) {
+          .header { flex-wrap: wrap; height: auto; padding-top: 10px; padding-bottom: 10px; row-gap: 10px; }
+          .nav-center { position: static; transform: none; order: 2; width: 100%; }
+          .header-right { order: 3; width: 100%; justify-content: flex-end; }
+        }
+
         @media (max-width: 768px) {
-          .header { padding: 0 16px; height: 54px; }
-          .brand-tag, .search-input { display: none; }
+          .header { padding: 0 16px; height: auto; padding-top: 10px; padding-bottom: 10px; }
+          .brand-tag { display: none; }
+          .nav-center { position: static; transform: none; order: 2; width: 100%; margin-top: 0; }
           .main { padding: 16px 16px 80px; }
           .stats-bar { gap: 8px; }
           .stat { padding: 10px 14px; min-width: 0; flex: 1; }
           .stat-val { font-size: 20px; }
           .filter-bar { gap: 6px; }
-          .m-search { display: block !important; width: 100%; background: #14141A; border: 1px solid #2A2A36; border-radius: 10px; padding: 11px 14px; font-size: 14px; color: #F0F0F6; outline: none; font-family: inherit; margin-bottom: 14px; }
+          .ss-topbar .ss-search { width: 100%; }
           .team-strip-top { flex-direction: column; align-items: flex-start; gap: 4px; }
           .board { margin: 0 -16px; padding: 0 16px 16px; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
           .col { flex: 0 0 252px; }
@@ -1968,7 +2489,6 @@ export default function StudioTracker() {
           .btn-primary, .btn-danger { width: 100%; }
           .toast { font-size: 12px; max-width: calc(100vw - 32px); white-space: normal; text-align: center; }
         }
-        .m-search { display: none; }
       `}</style>
 
       {/* HEADER */}
@@ -1984,20 +2504,24 @@ export default function StudioTracker() {
             <HeaderNickname userId={user.id} colorName={boardProfile} />
           )}
         </div>
-        <div className="header-right">
-          {/* Page nav */}
+        <div className="nav-center">
           <div className="page-nav">
             <button className={`page-nav-btn ${page === "projects" ? "active" : ""}`} onClick={() => setPage("projects")}>Projects</button>
             <button className={`page-nav-btn ${page === "selectsets" ? "active" : ""}`} onClick={() => setPage("selectsets")}>Select Sets</button>
+            <button className={`page-nav-btn ${page === "licensing" ? "active" : ""}`} onClick={() => setPage("licensing")}>
+              Licensing{licOpenCount > 0 ? <span className="nav-badge">{licOpenCount}</span> : null}
+              {hasLicensingAccess && page !== "licensing" && licDoneUpdatedCount > 0 ? <span className="nav-dot" title="New completed updates" /> : null}
+            </button>
           </div>
+        </div>
+        <div className="header-right">
           {page === "projects" && <>
-            <input className="search-input" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search…" />
             <div className="view-toggle">
               <button className={`view-btn ${view === "board"    ? "active" : ""}`} onClick={() => setView("board")}>Board</button>
               <button className={`view-btn ${view === "list"     ? "active" : ""}`} onClick={() => setView("list")}>List</button>
               <button className={`view-btn ${view === "calendar" ? "active" : ""}`} onClick={() => setView("calendar")}>Calendar</button>
             </div>
-            {canEdit && <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New</button>}
+            {canEditProjects && <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New</button>}
           </>}
           <UserButton
             afterSignOutUrl="/"
@@ -2010,20 +2534,48 @@ export default function StudioTracker() {
 
       {page === "selectsets" ? (
         <main className="main">
-          <SelectSetsPage sets={sets} projects={projects} onSave={handleSSave} onDelete={handleSDelete} canEdit={canEdit} />
+          <SelectSetsPage sets={sets} projects={projects} onSave={handleSSave} onDelete={handleSDelete} canEdit={canEditSelectSets} />
+        </main>
+      ) : page === "licensing" ? (
+        <main className="main">
+          <LicensingPage
+            requests={licRequests}
+            projects={projects}
+            onSave={(data) => handleLicSave({
+              ...data,
+              createdBy: data.createdBy || actor,
+            })}
+            onDelete={handleLicDelete}
+            canCreate={canCreateLicensing}
+            canEdit={canEditLicensing}
+            canResolve={canResolveLicensing}
+          />
         </main>
       ) : (
       <main className="main">
-        <input className="m-search" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search projects…" />
-
-        <h1 className="page-title">{boardMode === "presentations" ? "Presentations" : "Projects"}</h1>
-        <p className="page-sub">{activeCount} {boardMode === "presentations" ? "presentations" : "products"} · drag to move or reassign</p>
+        <div className="ss-topbar">
+          <div>
+            <h1 className="page-title">{boardMode === "presentations" ? "Presentations" : "Projects"}</h1>
+            <p className="page-sub">{activeCount} {boardMode === "presentations" ? "presentations" : "products"} · drag to move or reassign</p>
+          </div>
+          <input
+            className="ss-search"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search projects…"
+          />
+        </div>
 
         {/* Stats */}
         <div className="stats-bar">
           <div className="stat">
             <div><div className="stat-val">{activeCount}</div><div className="stat-label">Active</div></div>
           </div>
+          {licOpenCount > 0 && (
+            <div className="stat" style={{ borderColor: "rgba(251,191,36,0.25)", cursor:"pointer" }} onClick={() => setPage("licensing")}>
+              <div><div className="stat-val" style={{ color: C.amber }}>{licOpenCount}</div><div className="stat-label">Licensing open</div></div>
+            </div>
+          )}
           <div className="stat" style={{ borderColor: "rgba(52,211,153,0.25)" }}>
             <div><div className="stat-val" style={{ color: C.green }}>{prodCount}</div><div className="stat-label">Prod Ready</div></div>
           </div>
@@ -2068,7 +2620,7 @@ export default function StudioTracker() {
         </div>
 
         {view === "board" ? (
-          <Board projects={filtered} onAssign={handleAssign} onReorder={handleReorder} onQuickAdd={handleQuickAdd} onOpen={p => setDrawer({ isNew: false, project: p })} stages={activeStages} canEdit={canEdit} />
+          <Board projects={filtered} onAssign={handleAssign} onReorder={handleReorder} onQuickAdd={handleQuickAdd} onOpen={p => setDrawer({ isNew: false, project: p })} stages={activeStages} canEdit={canEditProjects} />
         ) : view === "list" ? (
           <ListView projects={filtered.filter(p => p.stage !== "archived")} onOpen={p => setDrawer({ isNew: false, project: p })} />
         ) : (
@@ -2077,7 +2629,7 @@ export default function StudioTracker() {
       </main>
       )} {/* end page conditional */}
 
-      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onClose={() => setDrawer(null)} presentations={presentationProjects} readOnly={!canEdit} defaultAssigneeName={defaultAssignee(boardProfile)} />}
+      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onClose={() => setDrawer(null)} presentations={presentationProjects} readOnly={!canEditProjects} defaultAssigneeName={defaultAssignee(boardProfile)} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
