@@ -52,7 +52,8 @@ function createSupabaseStorage(url, anonKey) {
 
   async function set(key, value) {
     const isEmpty = !value || value === "[]" || value === "null";
-    if (isEmpty) {
+    const protectAgainstWipe = key === PROJECTS_KEY || key === SELECT_SETS_KEY;
+    if (protectAgainstWipe && isEmpty) {
       const { data } = await supabase.from(TABLE).select("value").eq("key", key).maybeSingle();
       if (data?.value && data.value !== "[]") {
         console.warn("[storage] Blocked empty save — team data already exists for", key);
