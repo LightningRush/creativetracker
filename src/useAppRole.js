@@ -63,10 +63,16 @@ export function useAppRole() {
   const isViewer = role === "viewer";
   const canEdit = !isViewer;
   const boardName = user ? readBoardTeamName(user) : null;
+  const isLicensingTeam =
+    typeof boardName === "string" && boardName.trim().toLowerCase() === "licensing";
+  const licensingAccess = user?.publicMetadata?.licensingAccess;
+  const hasLicensingAccess = isLicensingTeam || licensingAccess === true;
 
   return {
     canEdit,
     isViewer,
+    isLicensingTeam,
+    hasLicensingAccess,
     role,
     isLoaded: isLoaded && !!user,
     boardName,
