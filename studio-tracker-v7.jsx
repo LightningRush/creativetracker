@@ -102,12 +102,106 @@ const normalizeProjectForSave = (p) => {
   return { ...rest, assignees: assignees.length ? assignees : [TEAM[0].name] };
 };
 
+const PROJ_HIGHLIGHT_SEEN_PREFIX = "st_proj_highlight_seen_";
+
+function loadProjectHighlightSeen(userId) {
+  if (!userId) return {};
+  try {
+    const raw = localStorage.getItem(`${PROJ_HIGHLIGHT_SEEN_PREFIX}${userId}`);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveProjectHighlightSeen(userId, map) {
+  if (!userId) return;
+  try {
+    localStorage.setItem(`${PROJ_HIGHLIGHT_SEEN_PREFIX}${userId}`, JSON.stringify(map));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+/** Glow only for assignees — until they click to acknowledge */
+function shouldGlowProjectForViewer(p, seenMap, viewerName) {
+  if (!p?.id || !viewerName) return false;
+  const assignees = projectAssignees(p);
+  if (!assignees.includes(viewerName)) return false;
+
+  if (
+    p.assignHighlightAt &&
+    seenMap[`${p.id}:assign`] !== p.assignHighlightAt
+  ) {
+    const forNames = Array.isArray(p.assignHighlightFor) ? p.assignHighlightFor : [];
+    if (forNames.length === 0 || forNames.includes(viewerName)) return true;
+  }
+  if (p.highlightAt && seenMap[p.id] !== p.highlightAt) return true;
+  return false;
+}
+
+function projectHighlightSeenKeys(project) {
+  const keys = {};
+  if (project?.highlightAt) keys[project.id] = project.highlightAt;
+  if (project?.assignHighlightAt) keys[`${project.id}:assign`] = project.assignHighlightAt;
+  return keys;
+}
+
 const SEASONS = ["SS25", "FW25", "SS26", "FW26", "Resort 26", "Evergreen"];
 
 const SEED = [];
 
 const ALL_STAGES = [...STAGES, ...PRES_STAGES.filter(s => s.id !== "archived")];
 const stageOf   = (id) => ALL_STAGES.find(s => s.id === id) || STAGES[0];
+const isPresStage = (id) => PRES_STAGES.some(s => s.id === id);
+const isProdStage = (id) => STAGES.some(s => s.id === id);
+
+/** Rough stage mapping when moving between Products and Presentations boards */
+const STAGE_CROSS_MAP = {
+  concept: "brief",
+  design_dev: "building",
+  awaiting_sales: "building",
+  tech_pack: "review",
+  sampling: "review",
+  revision: "review",
+  prod_ready: "picks_in",
+  archived: "archived",
+  brief: "concept",
+  building: "design_dev",
+  review: "tech_pack",
+  sent: "sampling",
+  picks_in: "prod_ready",
+};
+
+function mapStageForBoardChange(stage, targetType) {
+  if (targetType === "presentation") {
+    if (isPresStage(stage)) return stage;
+    return STAGE_CROSS_MAP[stage] || "brief";
+  }
+  if (isProdStage(stage)) return stage;
+  return STAGE_CROSS_MAP[stage] || "concept";
+}
+
+function convertProjectBetweenBoards(p, targetType) {
+  const current = p.projectType === "presentation" ? "presentation" : "product";
+  if (current === targetType) return p;
+  const nextStage = mapStageForBoardChange(p.stage, targetType);
+  if (targetType === "presentation") {
+    const { sourcePresId: _s, ...rest } = p;
+    return {
+      ...rest,
+      projectType: "presentation",
+      stage: nextStage,
+      styleNumbers: [],
+    };
+  }
+  const { customer: _c, presentationId: _p, ...rest } = p;
+  return {
+    ...rest,
+    projectType: "product",
+    stage: nextStage,
+  };
+}
 const initials  = (name) => name.split(" ").map(w => w[0]).join("");
 // Date inputs are YYYY-MM-DD — parse as local midnight (not UTC) to match calendar view
 const parseLocalDate = (d) => {
@@ -239,6 +333,11 @@ function diffProjectActivity(prev, next, by) {
   if ((prev.sourcePresId || "") !== (next.sourcePresId || "")) {
     if (!next.sourcePresId) entries.push(newActivityEntry(by, "Unlinked source presentation"));
     else entries.push(newActivityEntry(by, "Linked to a source presentation"));
+  }
+  const prevType = prev.projectType === "presentation" ? "presentation" : "product";
+  const nextType = next.projectType === "presentation" ? "presentation" : "product";
+  if (prevType !== nextType) {
+    entries.push(newActivityEntry(by, nextType === "presentation" ? "Moved to Presentations board" : "Moved to Products board"));
   }
   return entries;
 }
@@ -567,14 +666,15 @@ function HeatmapCard({ projects }) {
 }
 
 // ─── BOARD CARD ──────────────────────────────────────────────────────────────
-function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, canEdit = true }) {
+function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, canEdit = true, isNewHighlight = false }) {
   const days    = daysUntil(project.dueDate);
   const overdue = days !== null && days < 0;
   const dueSoon = days !== null && days >= 0 && days <= 14;
   const cc      = catColor(project.category);
+
   return (
     <div
-      className={`card ${isDragging ? "card-dragging" : ""} ${isDropTarget ? "card-drop-target" : ""} ${!canEdit ? "card-view-only" : ""}`}
+      className={`card ${isDragging ? "card-dragging" : ""} ${isDropTarget ? "card-drop-target" : ""} ${isNewHighlight ? "card-new" : ""} ${!canEdit ? "card-view-only" : ""}`}
       onPointerDown={canEdit ? (e) => onPointerDown(e, project) : undefined}
       onClick={() => { if (!isDragging) onOpen(project); }}
       data-card-id={project.id}
@@ -632,7 +732,8 @@ function QuickAdd({ stageId, onAdd, canEdit = true }) {
 }
 
 // ─── BOARD ───────────────────────────────────────────────────────────────────
-function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STAGES, canEdit = true }) {
+function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STAGES, canEdit = true, shouldGlowProject }) {
+  const isHighlighted = (p) => shouldGlowProject?.(p) ?? false;
   const [drag,      _setDrag]  = useState(null);
   const [hover,     _setHover] = useState(null);
   const [collapsed, setCollapsed] = useState(new Set(["archived"]));
@@ -844,7 +945,7 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
                     return (
                       <div key={p.id}>
                         {isBeforeMarker && <div className="drop-marker" />}
-                        <BoardCard project={p} isDragging={isDC && drag.project.id === p.id} isDropTarget={isTeamDropTarget} onPointerDown={handleCardPointerDown} onOpen={onOpen} canEdit={canEdit} />
+                        <BoardCard project={p} isDragging={isDC && drag.project.id === p.id} isDropTarget={isTeamDropTarget} onPointerDown={handleCardPointerDown} onOpen={onOpen} canEdit={canEdit} isNewHighlight={isHighlighted(p)} />
                       </div>
                     );
                   })}
@@ -873,7 +974,7 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
 }
 
 // ─── LIST VIEW ───────────────────────────────────────────────────────────────
-function ListView({ projects, onOpen }) {
+function ListView({ projects, onOpen, shouldGlowProject }) {
   return (
     <div className="list">
       {projects.length === 0
@@ -883,8 +984,9 @@ function ListView({ projects, onOpen }) {
           const days = daysUntil(p.dueDate);
           const overdue = days !== null && days < 0;
           const cc = catColor(p.category);
+          const isNew = shouldGlowProject?.(p) ?? false;
           return (
-            <div key={p.id} className="list-row" onClick={() => onOpen(p)} style={{ "--cc": cc }}>
+            <div key={p.id} className={`list-row ${isNew ? "list-row-new" : ""}`} onClick={() => onOpen(p)} style={{ "--cc": cc }}>
               <div className="list-stripe" />
               <div className="list-main">
                 <div className="list-title">{p.title}</div>
@@ -1051,7 +1153,7 @@ function ActivityLog({ activity }) {
 }
 
 // ─── DRAWER ──────────────────────────────────────────────────────────────────
-function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, readOnly = false, defaultAssigneeName = TEAM[0].name }) {
+function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presentations, readOnly = false, defaultAssigneeName = TEAM[0].name }) {
   const [form, setForm] = useState(() => {
     if (project) return { ...project, assignees: projectAssignees(project) };
     return {
@@ -1103,6 +1205,7 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, read
           <input value={form.title} onChange={e => set("title", e.target.value)} readOnly={readOnly}
             placeholder={isPresentation ? "e.g. Costco FW26 Home Goods Pitch" : "Product name"}
             autoFocus={isNew && !readOnly} className="drawer-title" />
+
           <div className="field-grid">
             <Field label="Stage">
               <Select value={form.stage} onChange={e => set("stage", e.target.value)} disabled={readOnly}>
@@ -1149,20 +1252,35 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, presentations, read
           {!isNew && <ActivityLog activity={form.activity} />}
           {!readOnly ? (
           <div className="drawer-actions">
-            <button onClick={() => onSave(normalizeProjectForSave({
-              ...form,
-              id: form.id || `p${Date.now()}`,
-              styleNumbers: normalizeStyleEntries(form.styleNumbers),
-            }))} disabled={!form.title.trim()} className="btn-primary">
-              {isNew ? "Create project" : "Save changes"}
-            </button>
-            {!isNew && (
-              confirmDelete
-                ? <div style={{ display:"flex", gap:8, flex:1 }}>
-                    <button onClick={() => onDelete(form.id)} className="btn-danger" style={{ flex:1 }}>Yes, delete</button>
-                    <button onClick={() => setConfirmDelete(false)} className="btn-cancel">Cancel</button>
-                  </div>
-                : <button onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
+            <div className="drawer-actions-row">
+              <button onClick={() => onSave(normalizeProjectForSave({
+                ...form,
+                id: form.id || `p${Date.now()}`,
+                styleNumbers: normalizeStyleEntries(form.styleNumbers),
+              }))} disabled={!form.title.trim()} className="btn-primary">
+                {isNew ? "Create project" : "Save changes"}
+              </button>
+              {!isNew && (
+                confirmDelete
+                  ? <div style={{ display:"flex", gap:8, flex:1 }}>
+                      <button onClick={() => onDelete(form.id)} className="btn-danger" style={{ flex:1 }}>Yes, delete</button>
+                      <button onClick={() => setConfirmDelete(false)} className="btn-cancel">Cancel</button>
+                    </div>
+                  : <button onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
+              )}
+            </div>
+            {!isNew && onMoveBoard && (
+              <button
+                type="button"
+                className="drawer-move-board"
+                onClick={() => onMoveBoard(normalizeProjectForSave({
+                  ...form,
+                  id: form.id,
+                  styleNumbers: normalizeStyleEntries(form.styleNumbers),
+                }), isPresentation ? "product" : "presentation")}
+              >
+                {isPresentation ? "Move to Products board" : "Move to Presentations board"}
+              </button>
             )}
           </div>
           ) : (
@@ -1752,6 +1870,7 @@ function LicensingPage({
 export default function StudioTracker() {
   const { canEdit, isViewer, isLicensingTeam, hasLicensingAccess, boardName, user, isLoaded } = useAppRole();
   const boardProfile = resolveTeamProfile(boardName) || boardName;
+  const viewerAssigneeName = defaultAssignee(boardProfile);
   const actor = activityActor(boardProfile, user);
   const canEditProjects = canEdit && !isLicensingTeam;
   const canEditSelectSets = canEdit && !isLicensingTeam;
@@ -1788,8 +1907,73 @@ export default function StudioTracker() {
   const [view,           setView]           = useState("board");
   const [boardMode,      setBoardMode]      = useState("products"); // "products" | "presentations"
   const [drawer,         setDrawer]         = useState(null);
-  const [toast,          setToast]          = useState(null);
-  const flash = (msg) => { setToast(msg); setTimeout(() => setToast(null), 2400); };
+  const [projectHighlightSeen, setProjectHighlightSeen] = useState(() => loadProjectHighlightSeen(user?.id));
+  const [toast,          setToast]          = useState(null); // { message, onUndo? }
+  const toastTimerRef = useRef(null);
+
+  useEffect(() => {
+    if (user?.id) setProjectHighlightSeen(loadProjectHighlightSeen(user.id));
+  }, [user?.id]);
+
+  const markProjectSeen = useCallback((project) => {
+    if (!user?.id || !project?.id) return;
+    const keys = projectHighlightSeenKeys(project);
+    if (!Object.keys(keys).length) return;
+    setProjectHighlightSeen(prev => {
+      let changed = false;
+      const next = { ...prev };
+      for (const [k, v] of Object.entries(keys)) {
+        if (next[k] !== v) {
+          next[k] = v;
+          changed = true;
+        }
+      }
+      if (!changed) return prev;
+      saveProjectHighlightSeen(user.id, next);
+      return next;
+    });
+  }, [user?.id]);
+
+  const shouldGlowProject = useCallback(
+    (p) => shouldGlowProjectForViewer(p, projectHighlightSeen, viewerAssigneeName),
+    [projectHighlightSeen, viewerAssigneeName],
+  );
+
+  const openProject = useCallback((p) => {
+    markProjectSeen(p);
+    setDrawer({ isNew: false, project: p });
+  }, [markProjectSeen]);
+
+  const clearToastTimer = () => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+  };
+
+  const flash = useCallback((msg) => {
+    clearToastTimer();
+    setToast({ message: msg });
+    toastTimerRef.current = setTimeout(() => setToast(null), 2400);
+  }, []);
+
+  const showUndoToast = useCallback((message, onUndo, ms = 5000) => {
+    clearToastTimer();
+    setToast({ message, onUndo });
+    toastTimerRef.current = setTimeout(() => setToast(null), ms);
+  }, []);
+
+  const runUndo = useCallback(() => {
+    if (!toast?.onUndo) return;
+    const undo = toast.onUndo;
+    clearToastTimer();
+    setToast(null);
+    undo();
+  }, [toast]);
+
+  useEffect(() => () => {
+    clearToastTimer();
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -1873,7 +2057,12 @@ export default function StudioTracker() {
     const current = projectAssignees(proj);
     if (current.includes(name)) return;
     const assignees = [...current, name];
-    const updated = withActivity(proj, normalizeProjectForSave({ ...proj, assignees }), actor);
+    const updated = withActivity(proj, normalizeProjectForSave({
+      ...proj,
+      assignees,
+      assignHighlightAt: new Date().toISOString(),
+      assignHighlightFor: [name],
+    }), actor);
     const next = projects.map(p => p.id === id ? updated : p);
     saveProjects(next, `Added ${name} to "${proj.title}"`);
   }, [projects, saveProjects, actor, canEditProjects]);
@@ -1895,17 +2084,27 @@ export default function StudioTracker() {
     const assignees = assigneeFilter
       ? [assigneeFilter]
       : [defaultAssignee(boardProfile)];
-    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [] };
+    const highlightAt = new Date().toISOString();
+    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [], highlightAt };
     const created = withActivity(null, p, actor);
     saveProjects([...projects, created], `Added "${title}"`);
-  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, boardProfile, canEditProjects, actor]);
+  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, canEditProjects, actor]);
 
   const handleSave = (data) => {
     if (!canEditProjects) return;
     const exists = projects.some(p => p.id === data.id);
     const prev = exists ? projects.find(p => p.id === data.id) : null;
+    const prevAs = prev ? projectAssignees(prev) : [];
+    const nextAs = projectAssignees(data);
+    const addedAssignees = nextAs.filter(n => !prevAs.includes(n));
+    const highlightPatch = !exists
+      ? { highlightAt: new Date().toISOString() }
+      : addedAssignees.length
+        ? { assignHighlightAt: new Date().toISOString(), assignHighlightFor: addedAssignees }
+        : {};
     const payload = normalizeProjectForSave({
       ...data,
+      ...highlightPatch,
       styleNumbers: normalizeStyleEntries(data.styleNumbers),
     });
     const updated = withActivity(prev, payload, actor);
@@ -1913,10 +2112,31 @@ export default function StudioTracker() {
     saveProjects(next);
     setDrawer(null);
   };
+
+  const handleMoveBoard = (data, targetType) => {
+    if (!canEditProjects) return;
+    const prev = projects.find(p => p.id === data.id);
+    if (!prev) return;
+    const payload = normalizeProjectForSave({
+      ...data,
+      styleNumbers: normalizeStyleEntries(data.styleNumbers),
+    });
+    const converted = convertProjectBetweenBoards(payload, targetType);
+    const updated = withActivity(prev, converted, actor);
+    const next = projects.map(p => p.id === data.id ? updated : p);
+    setBoardMode(targetType === "presentation" ? "presentations" : "products");
+    saveProjects(next, targetType === "presentation" ? "Moved to Presentations" : "Moved to Products");
+    setDrawer(null);
+  };
   const handleDelete = (id) => {
     if (!canEditProjects) return;
-    saveProjects(projects.filter(p => p.id !== id));
+    const removed = projects.find(p => p.id === id);
+    if (!removed) return;
+    const snapshot = projects;
+    const next = projects.filter(p => p.id !== id);
     setDrawer(null);
+    saveProjects(next);
+    showUndoToast(`Deleted “${removed.title}”`, () => saveProjects(snapshot));
   };
 
   const presentationProjects = projects.filter(p => p.projectType === "presentation");
@@ -1983,7 +2203,16 @@ export default function StudioTracker() {
   };
   const handleSDelete = (id) => {
     if (!canEditSelectSets) return;
-    setSets(prev => { const next = prev.filter(s => s.id !== id); saveSS(next); return next; });
+    const removed = sets.find(s => s.id === id);
+    if (!removed) return;
+    const snapshot = sets;
+    const next = sets.filter(s => s.id !== id);
+    setSets(next);
+    saveSS(next);
+    showUndoToast(`Deleted “${removed.name}”`, () => {
+      setSets(snapshot);
+      saveSS(snapshot);
+    });
   };
 
   const handleLicSave = (data) => {
@@ -2012,10 +2241,15 @@ export default function StudioTracker() {
 
   const handleLicDelete = (id) => {
     if (!canEditLicensing) return;
-    setLicRequests(prev => {
-      const next = prev.filter(r => r.id !== id);
-      saveLic(next);
-      return next;
+    const removed = licRequests.find(r => r.id === id);
+    if (!removed) return;
+    const snapshot = licRequests;
+    const next = licRequests.filter(r => r.id !== id);
+    setLicRequests(next);
+    saveLic(next);
+    showUndoToast("Deleted licensing request", () => {
+      setLicRequests(snapshot);
+      saveLic(snapshot);
     });
   };
 
@@ -2195,6 +2429,24 @@ export default function StudioTracker() {
         .card:active { cursor: grabbing; }
         .card-dragging { opacity: 0.2; transform: scale(0.97); }
         .card-drop-target { border-color: #8B7FFF !important; box-shadow: 0 0 0 2px rgba(139,127,255,0.4) !important; }
+        .card-new {
+          border-color: color-mix(in srgb, var(--cc) 55%, #2A2A36) !important;
+          animation: cardNewPulse 2.4s ease-in-out infinite;
+        }
+        @keyframes cardNewPulse {
+          0%, 100% {
+            box-shadow:
+              0 0 0 2px color-mix(in srgb, var(--cc) 45%, transparent),
+              0 0 12px color-mix(in srgb, var(--cc) 28%, transparent),
+              0 4px 16px rgba(0,0,0,0.4);
+          }
+          50% {
+            box-shadow:
+              0 0 0 2px color-mix(in srgb, var(--cc) 70%, transparent),
+              0 0 20px color-mix(in srgb, var(--cc) 42%, transparent),
+              0 4px 16px rgba(0,0,0,0.4);
+          }
+        }
         .card-stripe { width: 3px; flex-shrink: 0; background: var(--cc); border-radius: 9px 0 0 9px; }
         .card-drop-bar { position: absolute; top: 0; left: 0; right: 0; height: 2px; background: #8B7FFF; border-radius: 9px 9px 0 0; pointer-events: none; }
         .card-body { padding: 11px 12px; flex: 1; min-width: 0; }
@@ -2268,6 +2520,14 @@ export default function StudioTracker() {
         .list-row { display: grid; grid-template-columns: 3px 1fr 130px 160px 90px; align-items: center; border-bottom: 1px solid #1E1E28; cursor: pointer; transition: background 0.12s; }
         .list-row:last-child { border-bottom: none; }
         .list-row:hover { background: #1C1C24; }
+        .list-row-new {
+          animation: listRowNewPulse 2.4s ease-in-out infinite;
+          background: color-mix(in srgb, var(--cc) 10%, #14141A);
+        }
+        @keyframes listRowNewPulse {
+          0%, 100% { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--cc) 50%, transparent); }
+          50% { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--cc) 85%, transparent), inset 0 0 24px color-mix(in srgb, var(--cc) 12%, transparent); }
+        }
         .list-stripe { width: 3px; height: 100%; background: var(--cc); align-self: stretch; }
         .list-main { padding: 14px 16px 14px 14px; }
         .list-title { font-size: 14px; font-weight: 600; color: #F0F0F6; margin-bottom: 4px; }
@@ -2296,6 +2556,15 @@ export default function StudioTracker() {
         .eyebrow { font-size: 10px; letter-spacing: 0.12em; color: #56566A; text-transform: uppercase; font-weight: 700; }
         .close-btn { background: none; border: none; font-size: 18px; color: #56566A; cursor: pointer; width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
         .close-btn:hover { background: #1C1C24; color: #F0F0F6; }
+        .drawer-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 24px; }
+        .drawer-actions-row { display: flex; gap: 10px; width: 100%; }
+        .drawer-move-board {
+          width: 100%; padding: 13px 18px;
+          background: #1C1C24; border: 1px solid #2A2A36; border-radius: 8px;
+          color: #9494B0; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+          min-height: 46px; transition: all 0.15s;
+        }
+        .drawer-move-board:hover { background: #23232D; border-color: #3A3A50; color: #F0F0F6; }
         .drawer-title { width: 100%; background: transparent; border: none; border-bottom: 2px solid #2A2A36; outline: none; font-family: 'Open Sans', sans-serif; font-size: 20px; font-weight: 700; color: #F0F0F6; margin-bottom: 22px; padding: 0 0 10px; box-sizing: border-box; transition: border-color 0.2s; }
         .drawer-title:focus { border-bottom-color: #8B7FFF; }
         .drawer-title::placeholder { color: #3A3A50; }
@@ -2316,7 +2585,6 @@ export default function StudioTracker() {
         .activity-text { font-size: 12px; color: #F0F0F6; line-height: 1.4; }
         .activity-meta { font-size: 10px; color: #56566A; margin-top: 4px; }
         .activity-empty { font-size: 12px; color: #56566A; line-height: 1.45; }
-        .drawer-actions { display: flex; gap: 10px; margin-top: 24px; }
         .btn-primary { flex: 1; padding: 13px 0; font-size: 14px; font-weight: 700; background: #8B7FFF; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-family: inherit; min-height: 46px; transition: opacity 0.15s; }
         .btn-primary:hover { opacity: 0.88; }
         .btn-primary:disabled { background: #2A2A36; color: #56566A; cursor: not-allowed; opacity: 1; }
@@ -2519,7 +2787,20 @@ export default function StudioTracker() {
         .lic-status-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 
         /* ── TOAST ── */
-        .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #23232D; border: 1px solid #2A2A36; color: #F0F0F6; padding: 10px 18px; border-radius: 100px; font-size: 13px; font-weight: 500; box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 9998; animation: ti 0.2s ease-out; white-space: nowrap; }
+        .toast {
+          position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+          background: #23232D; border: 1px solid #2A2A36; color: #F0F0F6;
+          padding: 10px 14px 10px 18px; border-radius: 100px; font-size: 13px; font-weight: 500;
+          box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 9998; animation: ti 0.2s ease-out;
+          display: inline-flex; align-items: center; gap: 12px; max-width: min(92vw, 520px);
+        }
+        .toast-msg { line-height: 1.35; }
+        .toast-undo {
+          flex-shrink: 0; padding: 5px 12px; border-radius: 100px; border: 1px solid #8B7FFF55;
+          background: #8B7FFF22; color: #8B7FFF; font-size: 12px; font-weight: 700;
+          cursor: pointer; font-family: inherit; transition: background 0.15s;
+        }
+        .toast-undo:hover { background: #8B7FFF33; }
         @keyframes ti { from { opacity:0; transform:translate(-50%,6px); } to { opacity:1; transform:translate(-50%,0); } }
 
         /* ── MOBILE ── */
@@ -2555,8 +2836,8 @@ export default function StudioTracker() {
           .drawer-title { font-size: 18px; }
           .field-grid { grid-template-columns: 1fr; gap: 12px; }
           .ui-input { font-size: 16px; }
-          .drawer-actions { flex-direction: column-reverse; }
-          .btn-primary, .btn-danger { width: 100%; }
+          .drawer-actions-row { flex-direction: column; }
+          .btn-primary, .btn-danger, .drawer-move-board { width: 100%; }
           .toast { font-size: 12px; max-width: calc(100vw - 32px); white-space: normal; text-align: center; }
         }
       `}</style>
@@ -2690,17 +2971,24 @@ export default function StudioTracker() {
         </div>
 
         {view === "board" ? (
-          <Board projects={filtered} onAssign={handleAssign} onReorder={handleReorder} onQuickAdd={handleQuickAdd} onOpen={p => setDrawer({ isNew: false, project: p })} stages={activeStages} canEdit={canEditProjects} />
+          <Board projects={filtered} onAssign={handleAssign} onReorder={handleReorder} onQuickAdd={handleQuickAdd} onOpen={openProject} stages={activeStages} canEdit={canEditProjects} shouldGlowProject={shouldGlowProject} />
         ) : view === "list" ? (
-          <ListView projects={filtered.filter(p => p.stage !== "archived")} onOpen={p => setDrawer({ isNew: false, project: p })} />
+          <ListView projects={filtered.filter(p => p.stage !== "archived")} onOpen={openProject} shouldGlowProject={shouldGlowProject} />
         ) : (
-          <CalendarView projects={filtered.filter(p => p.stage !== "archived")} onOpen={p => setDrawer({ isNew: false, project: p })} />
+          <CalendarView projects={filtered.filter(p => p.stage !== "archived")} onOpen={openProject} />
         )}
       </main>
       )} {/* end page conditional */}
 
-      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onClose={() => setDrawer(null)} presentations={presentationProjects} readOnly={!canEditProjects} defaultAssigneeName={defaultAssignee(boardProfile)} />}
-      {toast && <div className="toast">{toast}</div>}
+      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onMoveBoard={handleMoveBoard} onClose={() => setDrawer(null)} presentations={presentationProjects} readOnly={!canEditProjects} defaultAssigneeName={defaultAssignee(boardProfile)} />}
+      {toast && (
+        <div className="toast">
+          <span className="toast-msg">{toast.message}</span>
+          {toast.onUndo && (
+            <button type="button" className="toast-undo" onClick={runUndo}>Undo</button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
