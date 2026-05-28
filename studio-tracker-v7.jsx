@@ -85,6 +85,16 @@ const resolveTeamProfile = (raw) => {
   return fuzzy ? fuzzy.name : t;
 };
 
+/** Who is viewing the board — must match a TEAM strip name for assignee glow */
+function resolveViewerTeamName(boardName, nickname) {
+  for (const raw of [nickname, boardName]) {
+    if (!raw?.trim()) continue;
+    const resolved = resolveTeamProfile(raw.trim());
+    if (TEAM.some(t => t.name === resolved)) return resolved;
+  }
+  return null;
+}
+
 const projectAssignees = (p) => {
   if (!p) return [];
   if (Array.isArray(p.assignees) && p.assignees.length) {
@@ -129,14 +139,14 @@ function shouldGlowProjectForViewer(p, seenMap, viewerName) {
   const assignees = projectAssignees(p);
   if (!assignees.includes(viewerName)) return false;
 
-  if (
-    p.assignHighlightAt &&
-    seenMap[`${p.id}:assign`] !== p.assignHighlightAt
-  ) {
-    const forNames = Array.isArray(p.assignHighlightFor) ? p.assignHighlightFor : [];
-    if (forNames.length === 0 || forNames.includes(viewerName)) return true;
+  const assignSeen = seenMap[`${p.id}:assign`];
+  if (p.assignHighlightAt && assignSeen !== p.assignHighlightAt) {
+    const forNames = Array.isArray(p.assignHighlightFor) ? p.assignHighlightFor : null;
+    if (forNames === null) return true;
+    if (forNames.includes(viewerName)) return true;
   }
-  if (p.highlightAt && seenMap[p.id] !== p.highlightAt) return true;
+  const highlightSeen = seenMap[p.id];
+  if (p.highlightAt && highlightSeen !== p.highlightAt) return true;
   return false;
 }
 
@@ -620,7 +630,7 @@ function HeaderNickname({ userId, colorName }) {
               className="ui-input"
               value={draft}
               onChange={e => setDraft(e.target.value)}
-              placeholder="e.g. Rafa"
+              placeholder="e.g. Anthony C. (match Team strip)"
               autoFocus
               maxLength={32}
               onKeyDown={e => {
@@ -1870,7 +1880,8 @@ function LicensingPage({
 export default function StudioTracker() {
   const { canEdit, isViewer, isLicensingTeam, hasLicensingAccess, boardName, user, isLoaded } = useAppRole();
   const boardProfile = resolveTeamProfile(boardName) || boardName;
-  const viewerAssigneeName = defaultAssignee(boardProfile);
+  const { nickname } = useNickname(user?.id);
+  const viewerAssigneeName = resolveViewerTeamName(boardName, nickname);
   const actor = activityActor(boardProfile, user);
   const canEditProjects = canEdit && !isLicensingTeam;
   const canEditSelectSets = canEdit && !isLicensingTeam;
@@ -1994,11 +2005,28 @@ export default function StudioTracker() {
       }
     })();
 
+    const mergeProjectHighlights = (incoming, prev) => {
+      if (!Array.isArray(prev) || !prev.length) return incoming;
+      const prevById = new Map(prev.map(p => [p.id, p]));
+      return incoming.map(p => {
+        const loc = prevById.get(p.id);
+        if (!loc) return p;
+        return {
+          ...p,
+          highlightAt: p.highlightAt || loc.highlightAt,
+          assignHighlightAt: p.assignHighlightAt || loc.assignHighlightAt,
+          assignHighlightFor: (Array.isArray(p.assignHighlightFor) && p.assignHighlightFor.length)
+            ? p.assignHighlightFor
+            : loc.assignHighlightFor,
+        };
+      });
+    };
+
     const applyRemote = (setter, raw, normalize) => {
       try {
         let data = JSON.parse(raw);
         if (normalize && Array.isArray(data)) data = data.map(normalizeProjectForSave);
-        setter(data);
+        setter(prev => (normalize ? mergeProjectHighlights(data, prev) : data));
       } catch {
         /* ignore malformed payloads */
       }
@@ -2084,8 +2112,16 @@ export default function StudioTracker() {
     const assignees = assigneeFilter
       ? [assigneeFilter]
       : [defaultAssignee(boardProfile)];
-    const highlightAt = new Date().toISOString();
-    const p = { id: `p${Date.now()}`, title, stage: stageId, projectType: boardMode === "presentations" ? "presentation" : "product", category: categoryFilter !== "all" ? categoryFilter : "apparel", assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [], highlightAt };
+    const now = new Date().toISOString();
+    const p = {
+      id: `p${Date.now()}`, title, stage: stageId,
+      projectType: boardMode === "presentations" ? "presentation" : "product",
+      category: categoryFilter !== "all" ? categoryFilter : "apparel",
+      assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [],
+      highlightAt: now,
+      assignHighlightAt: now,
+      assignHighlightFor: assignees,
+    };
     const created = withActivity(null, p, actor);
     saveProjects([...projects, created], `Added "${title}"`);
   }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, canEditProjects, actor]);
@@ -2097,10 +2133,15 @@ export default function StudioTracker() {
     const prevAs = prev ? projectAssignees(prev) : [];
     const nextAs = projectAssignees(data);
     const addedAssignees = nextAs.filter(n => !prevAs.includes(n));
+    const now = new Date().toISOString();
     const highlightPatch = !exists
-      ? { highlightAt: new Date().toISOString() }
+      ? {
+          highlightAt: now,
+          assignHighlightAt: now,
+          assignHighlightFor: nextAs,
+        }
       : addedAssignees.length
-        ? { assignHighlightAt: new Date().toISOString(), assignHighlightFor: addedAssignees }
+        ? { assignHighlightAt: now, assignHighlightFor: addedAssignees }
         : {};
     const payload = normalizeProjectForSave({
       ...data,
