@@ -769,13 +769,25 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
     return () => document.removeEventListener("touchmove", block);
   }, []);
 
-  // Wheel → horizontal scroll
+  // Wheel → horizontal scroll only when the board actually scrolls sideways (mobile)
   useEffect(() => {
     const el = boardRef.current;
     if (!el) return;
     const onWheel = (e) => {
       if (isDraggingRef.current) return;
-      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) { e.preventDefault(); el.scrollLeft += e.deltaY * 1.5; }
+
+      const colBody = e.target.closest?.(".col-body");
+      if (colBody && colBody.scrollHeight > colBody.clientHeight + 2) {
+        const atTop = colBody.scrollTop <= 0;
+        const atBottom = colBody.scrollTop + colBody.clientHeight >= colBody.scrollHeight - 2;
+        if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
+      }
+
+      const canScrollX = el.scrollWidth > el.clientWidth + 2;
+      if (!canScrollX) return;
+      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+      e.preventDefault();
+      el.scrollLeft += e.deltaY * 1.5;
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -2302,7 +2314,8 @@ export default function StudioTracker() {
         @import url('https://fonts.googleapis.com/css2?family=Open+Sans:wght@300;400;500;600;700;800&display=swap');
         *, *::before, *::after { box-sizing: border-box; }
         body { margin: 0; }
-        .app { min-height: 100vh; background: #0C0C10; color: #F0F0F6; font-family: 'Open Sans', sans-serif; -webkit-font-smoothing: antialiased; overscroll-behavior: contain; }
+        .app { min-height: 100vh; background: #0C0C10; color: #F0F0F6; font-family: 'Open Sans', sans-serif; -webkit-font-smoothing: antialiased; }
+        html { scroll-behavior: smooth; }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: #2A2A36; border-radius: 4px; }
@@ -2444,6 +2457,13 @@ export default function StudioTracker() {
         .col-body {
           display: flex; flex-direction: column; gap: 8px;
           flex: 1;
+          min-height: 0;
+          max-height: min(70vh, calc(100dvh - 300px));
+          overflow-y: auto;
+          overflow-x: hidden;
+          overscroll-behavior: contain;
+          -webkit-overflow-scrolling: touch;
+          scrollbar-gutter: stable;
         }
 
         /* ── COLUMNS ── */
@@ -2465,7 +2485,8 @@ export default function StudioTracker() {
         .team-chip-view { cursor: default; }
         .team-chip-view .chip-grip { display: none; }
         .ui-input:disabled, .ui-select:disabled, .ui-textarea:disabled { opacity: 0.85; cursor: default; }
-        .card { background: #1C1C24; border: 1px solid #2A2A36; border-radius: 10px; position: relative; cursor: grab; display: flex; width: 100%; transition: box-shadow 0.15s, border-color 0.15s, opacity 0.15s, transform 0.1s; user-select: none; -webkit-user-select: none; touch-action: none; }
+        .card { background: #1C1C24; border: 1px solid #2A2A36; border-radius: 10px; position: relative; cursor: grab; display: flex; width: 100%; transition: box-shadow 0.15s, border-color 0.15s, opacity 0.15s, transform 0.1s; user-select: none; -webkit-user-select: none; touch-action: pan-y; }
+        .card.card-dragging { touch-action: none; }
         .card:hover { border-color: #3A3A50; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
         .card:active { cursor: grabbing; }
         .card-dragging { opacity: 0.2; transform: scale(0.97); }
