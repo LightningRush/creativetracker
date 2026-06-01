@@ -59,6 +59,28 @@ const CATEGORIES = [
 const catColor = (id) => CATEGORIES.find(c => c.id === id)?.color || "#56566A";
 const catLabel = (id) => CATEGORIES.find(c => c.id === id)?.label || id;
 
+const PRIORITIES = [
+  { id: "", label: "None", color: null },
+  { id: "high", label: "High", color: "#FBBF24" },
+  { id: "urgent", label: "Urgent", color: "#F87171" },
+];
+const priorityOf = (p) => PRIORITIES.find(x => x.id === (p?.priority || "")) || PRIORITIES[0];
+const hasPriority = (p) => p?.priority === "high" || p?.priority === "urgent";
+const isPresentationProject = (p) => p?.projectType === "presentation";
+const isWaitingOnSalesProduct = (p) => !isPresentationProject(p) && (!!p?.waitingOnSales || p?.stage === "awaiting_sales");
+const isWaitingOnLicenses = (p) => isPresentationProject(p) && !!p?.waitingOnLicenses;
+const isWaitingOnSalesInfo = (p) => isPresentationProject(p) && !!p?.waitingOnSales;
+const isBlockedBySales = (p) => isWaitingOnSalesProduct(p) || isWaitingOnLicenses(p) || isWaitingOnSalesInfo(p);
+const prioritySortKey = (p) => (p?.priority === "urgent" ? 2 : p?.priority === "high" ? 1 : 0);
+
+function sortProjectsForBoard(items) {
+  return [...items].sort((a, b) => {
+    const pd = prioritySortKey(b) - prioritySortKey(a);
+    if (pd !== 0) return pd;
+    return (a.title || "").localeCompare(b.title || "", undefined, { sensitivity: "base" });
+  });
+}
+
 const TEAM = [
   { name: "Candace O.", color: "#F472B6" },
   { name: "Anthony C.", color: "#34D399" },
@@ -316,6 +338,19 @@ function diffProjectActivity(prev, next, by) {
   }
   if (prev.season !== next.season) {
     entries.push(newActivityEntry(by, `Season → ${next.season}`));
+  }
+  if ((prev.priority || "") !== (next.priority || "")) {
+    const label = priorityOf(next).label;
+    entries.push(newActivityEntry(by, label === "None" ? "Cleared priority" : `Priority → ${label}`));
+  }
+  if (!!prev.waitingOnSales !== !!next.waitingOnSales) {
+    const salesLabel = next.projectType === "presentation"
+      ? (next.waitingOnSales ? "Marked awaiting sales info" : "Cleared awaiting sales info")
+      : (next.waitingOnSales ? "Marked waiting on sales" : "Cleared waiting on sales");
+    entries.push(newActivityEntry(by, salesLabel));
+  }
+  if (!!prev.waitingOnLicenses !== !!next.waitingOnLicenses) {
+    entries.push(newActivityEntry(by, next.waitingOnLicenses ? "Marked needs licenses from sales" : "Cleared license hold"));
   }
   if ((prev.dueDate || "") !== (next.dueDate || "")) {
     entries.push(newActivityEntry(by, next.dueDate ? `Due date → ${fmt(next.dueDate)}` : "Cleared due date"));
@@ -675,16 +710,98 @@ function HeatmapCard({ projects }) {
   );
 }
 
+// ─── SIGNAL FILTERS & DRAWER TOGGLES ─────────────────────────────────────────
+function SignalFilterChip({ active, tone, label, count, onClick, title }) {
+  return (
+    <button
+      type="button"
+      className={`signal-chip ${tone} ${active ? "on" : ""}`}
+      onClick={onClick}
+      title={title}
+    >
+      <span className="signal-dot" aria-hidden />
+      <span className="signal-label">{label}</span>
+      {count != null && count > 0 && <span className="signal-count">{count}</span>}
+    </button>
+  );
+}
+
+function BlockerToggle({ checked, onChange, disabled, tone, title, description }) {
+  return (
+    <button
+      type="button"
+      className={`blocker-toggle ${tone} ${checked ? "on" : ""}`}
+      onClick={() => !disabled && onChange(!checked)}
+      disabled={disabled}
+      aria-pressed={checked}
+    >
+      <span className="blocker-toggle-mark" aria-hidden>{checked ? "✓" : ""}</span>
+      <span className="blocker-toggle-body">
+        <span className="blocker-toggle-title">{title}</span>
+        <span className="blocker-toggle-desc">{description}</span>
+      </span>
+    </button>
+  );
+}
+
+function PriorityPills({ value, onChange, readOnly }) {
+  return (
+    <div className="priority-pills" role="group" aria-label="Priority">
+      {PRIORITIES.map(p => (
+        <button
+          key={p.id || "none"}
+          type="button"
+          disabled={readOnly}
+          className={`priority-pill ${p.id ? `tone-${p.id}` : "tone-none"} ${(value || "") === p.id ? "on" : ""}`}
+          onClick={() => onChange(p.id)}
+        >
+          {p.id === "urgent" && <span className="priority-pill-dot" aria-hidden />}
+          {p.id === "high" && <span className="priority-pill-dot" aria-hidden />}
+          {p.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ─── PROJECT FLAGS (priority + sales blockers) ───────────────────────────────
+function ProjectFlags({ project, compact = false }) {
+  const pr = priorityOf(project);
+  const licenses = isWaitingOnLicenses(project);
+  const salesInfo = isWaitingOnSalesInfo(project);
+  const salesProduct = isWaitingOnSalesProduct(project);
+  if (!pr.id && !licenses && !salesInfo && !salesProduct) return null;
+  return (
+    <div className={`card-flags ${compact ? "compact" : ""}`}>
+      {pr.id && (
+        <span className={`card-flag flag-priority flag-priority-${pr.id}`}>{pr.label}</span>
+      )}
+      {licenses && (
+        <span className="card-flag flag-licenses">Needs licenses</span>
+      )}
+      {salesInfo && (
+        <span className="card-flag flag-sales-info">Awaiting sales info</span>
+      )}
+      {salesProduct && (
+        <span className="card-flag flag-sales">Awaiting sales</span>
+      )}
+    </div>
+  );
+}
+
 // ─── BOARD CARD ──────────────────────────────────────────────────────────────
 function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, canEdit = true, isNewHighlight = false }) {
   const days    = daysUntil(project.dueDate);
   const overdue = days !== null && days < 0;
   const dueSoon = days !== null && days >= 0 && days <= 14;
   const cc      = catColor(project.category);
+  const pr       = priorityOf(project);
+  const licenses = isWaitingOnLicenses(project);
+  const salesHold = isWaitingOnSalesInfo(project) || isWaitingOnSalesProduct(project);
 
   return (
     <div
-      className={`card ${isDragging ? "card-dragging" : ""} ${isDropTarget ? "card-drop-target" : ""} ${isNewHighlight ? "card-new" : ""} ${!canEdit ? "card-view-only" : ""}`}
+      className={`card ${isDragging ? "card-dragging" : ""} ${isDropTarget ? "card-drop-target" : ""} ${isNewHighlight ? "card-new" : ""} ${!canEdit ? "card-view-only" : ""} ${pr.id ? `card-priority-${pr.id}` : ""} ${licenses ? "card-waiting-licenses" : ""} ${salesHold ? "card-waiting-sales" : ""}`}
       onPointerDown={canEdit ? (e) => onPointerDown(e, project) : undefined}
       onClick={() => { if (!isDragging) onOpen(project); }}
       data-card-id={project.id}
@@ -693,6 +810,7 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, c
       {isDropTarget && <div className="card-drop-bar" />}
       <div className="card-stripe" />
       <div className="card-body">
+        <ProjectFlags project={project} />
         <div className="card-title">{project.title}</div>
         <div className="card-tags">
           <span className="cat-chip" style={{ background: `${cc}22`, color: cc, border: `1px solid ${cc}44` }}>
@@ -943,7 +1061,7 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
       <div className="board" ref={boardRef}>
         {stages.map((stage, si) => {
           const stageIds = new Set(stages.map(s => s.id));
-          const items    = projects.filter(p => p.stage === stage.id || (si === 0 && !stageIds.has(p.stage)));
+          const items    = sortProjectsForBoard(projects.filter(p => p.stage === stage.id || (si === 0 && !stageIds.has(p.stage))));
           const isHov    = isDC && hover?.type === "stage" && hover.value === stage.id;
           const overdueCt = items.filter(p => { const d = daysUntil(p.dueDate); return d !== null && d < 0; }).length;
           const isColl   = collapsed.has(stage.id);
@@ -1012,6 +1130,7 @@ function ListView({ projects, onOpen, shouldGlowProject }) {
               <div className="list-stripe" />
               <div className="list-main">
                 <div className="list-title">{p.title}</div>
+                <ProjectFlags project={p} compact />
                 <div className="list-meta">
                   <span className="cat-chip sm" style={{ background: `${cc}22`, color: cc, border: `1px solid ${cc}44` }}>{catLabel(p.category)}</span>
                   <span className="sep">·</span><span>{p.season}</span>
@@ -1182,11 +1301,19 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
       title: "", category: "apparel", stage: "concept", projectType: "product",
       assignees: [defaultAssigneeName], season: "SS26",
       startDate: "", dueDate: "", notes: "", styleNumbers: [], presentationId: "", sourcePresId: "",
+      priority: "", waitingOnSales: false, waitingOnLicenses: false,
     };
   });
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const [confirmDelete, setConfirmDelete] = useState(false);
   const isPresentation = form.projectType === "presentation";
+  const setStage = (stageId) => {
+    setForm(f => ({
+      ...f,
+      stage: stageId,
+      waitingOnSales: f.projectType !== "presentation" && stageId === "awaiting_sales" ? true : f.waitingOnSales,
+    }));
+  };
   const isAwaitingSales = !isPresentation && form.stage === "awaiting_sales";
   const stageOptions   = isPresentation ? PRES_STAGES : STAGES;
   const [closing, setClosing] = useState(false);
@@ -1230,11 +1357,51 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
 
           <div className="field-grid">
             <Field label="Stage">
-              <Select value={form.stage} onChange={e => set("stage", e.target.value)} disabled={readOnly}>
+              <Select value={form.stage} onChange={e => setStage(e.target.value)} disabled={readOnly}>
                 {stageOptions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
               </Select>
             </Field>
+            <Field label="Priority" full>
+              <PriorityPills value={form.priority || ""} onChange={v => set("priority", v)} readOnly={readOnly} />
+            </Field>
             <Field label="Category"><Select value={form.category} onChange={e => set("category", e.target.value)} disabled={readOnly}>{CATEGORIES.filter(c => c.id !== "all").map(c => <option key={c.id} value={c.id}>{c.label}</option>)}</Select></Field>
+            {!isPresentation && (
+              <Field label="Blocked by sales" full>
+                <div className="blocker-toggles">
+                  <BlockerToggle
+                    checked={!!form.waitingOnSales}
+                    onChange={v => set("waitingOnSales", v)}
+                    disabled={readOnly}
+                    tone="sales"
+                    title="Awaiting sales"
+                    description="Waiting on info or SKUs from sales — shows on the board in any column."
+                  />
+                </div>
+              </Field>
+            )}
+            {isPresentation && (
+              <Field label="Blocked by sales" full>
+                <div className="blocker-toggles">
+                  <BlockerToggle
+                    checked={!!form.waitingOnLicenses}
+                    onChange={v => set("waitingOnLicenses", v)}
+                    disabled={readOnly}
+                    tone="licenses"
+                    title="Needs licenses"
+                    description="Sales must provide licenses before art can start."
+                  />
+                  <BlockerToggle
+                    checked={!!form.waitingOnSales}
+                    onChange={v => set("waitingOnSales", v)}
+                    disabled={readOnly}
+                    tone="sales"
+                    title="Awaiting sales info"
+                    description="Meeting held but brief or details aren’t ready yet."
+                  />
+                </div>
+                <p className="field-hint">Tags appear on the card so the team knows why work is paused.</p>
+              </Field>
+            )}
             {isPresentation && (
               <Field label="Customer"><Select value={form.customer || ""} onChange={e => set("customer", e.target.value)} disabled={readOnly}><option value="">— Select —</option>{CUSTOMERS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</Select></Field>
             )}
@@ -1926,6 +2093,7 @@ export default function StudioTracker() {
   }); // "projects" | "selectsets" | "licensing"
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [assigneeFilter, setAssigneeFilter] = useState(null);
+  const [boardTagFilter, setBoardTagFilter] = useState(null); // null | "priority" | "awaiting_sales" | "licenses" | "sales_info"
   const [search,         setSearch]         = useState("");
   const [view,           setView]           = useState("board");
   const [boardMode,      setBoardMode]      = useState("products"); // "products" | "presentations"
@@ -2234,9 +2402,14 @@ export default function StudioTracker() {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const catOk  = categoryFilter === "all" || p.category === categoryFilter;
     const asnOk  = !assigneeFilter || projectHasAssignee(p, assigneeFilter);
+    const tagOk  = !boardTagFilter
+      || (boardTagFilter === "priority" && hasPriority(p))
+      || (boardTagFilter === "awaiting_sales" && isBlockedBySales(p))
+      || (boardTagFilter === "licenses" && isWaitingOnLicenses(p))
+      || (boardTagFilter === "sales_info" && isWaitingOnSalesInfo(p));
     const q = search.toLowerCase();
     const txtOk  = !search || p.title.toLowerCase().includes(q) || styleNumbersOf(p).some(s => s.toLowerCase().includes(q));
-    return typeOk && catOk && asnOk && txtOk;
+    return typeOk && catOk && asnOk && tagOk && txtOk;
   });
   const activeStages  = boardMode === "presentations" ? PRES_STAGES : STAGES;
   const visibleNonArchived = filtered.filter(p => p.stage !== "archived");
@@ -2245,6 +2418,14 @@ export default function StudioTracker() {
   const presCount     = boardMode === "presentations" ? activeCount : presCountGlobal;
   const prodCount     = filtered.filter(p => p.stage === "prod_ready").length;
   const overdueCount  = visibleNonArchived.filter(p => { const d = daysUntil(p.dueDate); return d !== null && d < 0; }).length;
+  const productPool = projects.filter(p => p.projectType !== "presentation" && p.stage !== "archived");
+  const presPool = projects.filter(p => p.projectType === "presentation" && p.stage !== "archived");
+  const activePool = boardMode === "presentations" ? presPool : productPool;
+  const priorityCount = activePool.filter(hasPriority).length;
+  const awaitingSalesCount = productPool.filter(isWaitingOnSalesProduct).length;
+  const licensesCount = presPool.filter(isWaitingOnLicenses).length;
+  const presSalesInfoCount = presPool.filter(isWaitingOnSalesInfo).length;
+  const presBlockedCount = presPool.filter(p => isWaitingOnLicenses(p) || isWaitingOnSalesInfo(p)).length;
 
   const handleSSave = (data) => {
     if (!canEditSelectSets) return;
@@ -2394,9 +2575,17 @@ export default function StudioTracker() {
 
         /* ── STATS ── */
         .stats-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-        .stat { background: #14141A; border: 1px solid #2A2A36; border-radius: 10px; padding: 12px 16px; display: flex; align-items: center; gap: 10px; min-width: 110px; }
+        .stat { background: #14141A; border: 1px solid #2A2A36; border-radius: 10px; padding: 12px 16px; display: flex; align-items: center; gap: 10px; min-width: 110px; transition: border-color 0.15s, background 0.15s; }
         .stat-val { font-size: 22px; font-weight: 700; color: #F0F0F6; line-height: 1; }
         .stat-label { font-size: 11px; color: #56566A; margin-top: 2px; font-weight: 500; }
+        .stat-clickable { cursor: pointer; }
+        .stat-clickable:hover { background: #1C1C24; }
+        .stat-tone-priority .stat-val { color: #FBBF24; }
+        .stat-tone-priority.on { border-color: rgba(248,113,113,0.5); background: rgba(248,113,113,0.06); }
+        .stat-tone-sales .stat-val { color: #FBBF24; }
+        .stat-tone-sales.on { border-color: rgba(251,191,36,0.5); background: rgba(251,191,36,0.06); }
+        .stat-tone-licenses .stat-val { color: #8B7FFF; }
+        .stat-tone-licenses.on { border-color: rgba(139,127,255,0.5); background: rgba(139,127,255,0.08); }
 
         /* ── FILTER BAR ── */
         .filter-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
@@ -2409,6 +2598,98 @@ export default function StudioTracker() {
         .asn-chip { position: relative; cursor: pointer; transition: transform 0.15s; border-radius: 50%; border: 2px solid transparent; }
         .asn-chip:hover { transform: scale(1.1); }
         .asn-chip.asn-on { border-color: #8B7FFF; box-shadow: 0 0 0 2px #0C0C10, 0 0 0 4px #8B7FFF; }
+        .filter-signal-group {
+          display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+          background: #14141A; border: 1px solid #1E1E28; border-radius: 10px;
+          padding: 6px 12px 6px 14px;
+        }
+        .filter-group-label {
+          font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase;
+          color: #56566A; flex-shrink: 0; padding-right: 2px;
+        }
+        .signal-chip-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+        .signal-chip {
+          display: inline-flex; align-items: center; gap: 7px;
+          padding: 6px 11px; border-radius: 8px;
+          border: 1px solid #2A2A36; background: #1C1C24;
+          color: #9494B0; font-size: 11px; font-weight: 600;
+          cursor: pointer; font-family: inherit; transition: all 0.15s; white-space: nowrap;
+        }
+        .signal-chip:hover { border-color: #3A3A50; color: #F0F0F6; background: #23232D; }
+        .signal-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: #56566A; }
+        .signal-chip.priority .signal-dot { background: #F87171; }
+        .signal-chip.sales .signal-dot { background: #FBBF24; }
+        .signal-chip.licenses .signal-dot { background: #8B7FFF; }
+        .signal-chip.blocked .signal-dot { background: linear-gradient(135deg, #8B7FFF 50%, #FBBF24 50%); }
+        .signal-chip.on { color: #F0F0F6; border-color: #3A3A50; background: #23232D; box-shadow: inset 0 0 0 1px rgba(139,127,255,0.12); }
+        .signal-chip.on.priority { border-color: rgba(248,113,113,0.45); background: rgba(248,113,113,0.1); }
+        .signal-chip.on.sales { border-color: rgba(251,191,36,0.45); background: rgba(251,191,36,0.1); }
+        .signal-chip.on.licenses { border-color: rgba(139,127,255,0.45); background: rgba(139,127,255,0.12); }
+        .signal-chip.on.blocked { border-color: rgba(139,127,255,0.35); background: rgba(139,127,255,0.08); }
+        .signal-count {
+          font-size: 10px; font-weight: 700; line-height: 1;
+          padding: 2px 6px; border-radius: 100px;
+          background: #2A2A36; color: #9494B0; min-width: 18px; text-align: center;
+        }
+        .signal-chip.on .signal-count { background: rgba(255,255,255,0.1); color: #F0F0F6; }
+        .board-callout {
+          display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+          margin-bottom: 14px; padding: 12px 16px; border-radius: 10px;
+          background: #14141A; border: 1px solid #2A2A36;
+          font-size: 13px; color: #9494B0;
+        }
+        .board-callout-text { display: flex; align-items: center; gap: 10px; min-width: 0; }
+        .board-callout-dot {
+          width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+          background: #8B7FFF; box-shadow: 0 0 0 3px rgba(139,127,255,0.2);
+        }
+        .board-callout strong { color: #F0F0F6; font-weight: 600; }
+        .board-callout-count { display: block; font-size: 11px; color: #56566A; margin-top: 2px; font-weight: 500; }
+        .board-callout-clear {
+          padding: 7px 14px; border-radius: 8px; border: 1px solid #2A2A36; background: #1C1C24;
+          color: #9494B0; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit;
+          transition: all 0.15s; flex-shrink: 0;
+        }
+        .board-callout-clear:hover { border-color: #8B7FFF55; color: #F0F0F6; background: #23232D; }
+        .priority-pills {
+          display: flex; gap: 6px; flex-wrap: wrap;
+          background: #14141A; border: 1px solid #2A2A36; border-radius: 10px; padding: 4px;
+        }
+        .priority-pill {
+          flex: 1; min-width: 72px; padding: 8px 12px; border-radius: 7px;
+          border: 1px solid transparent; background: transparent;
+          color: #56566A; font-size: 12px; font-weight: 600; cursor: pointer;
+          font-family: inherit; transition: all 0.15s;
+          display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+        }
+        .priority-pill:hover:not(:disabled) { color: #9494B0; background: #1C1C24; }
+        .priority-pill.on { color: #F0F0F6; background: #23232D; border-color: #3A3A50; }
+        .priority-pill.tone-high.on { border-color: rgba(251,191,36,0.4); background: rgba(251,191,36,0.1); color: #FBBF24; }
+        .priority-pill.tone-urgent.on { border-color: rgba(248,113,113,0.45); background: rgba(248,113,113,0.1); color: #F87171; }
+        .priority-pill-dot { width: 6px; height: 6px; border-radius: 50%; }
+        .priority-pill.tone-high .priority-pill-dot { background: #FBBF24; }
+        .priority-pill.tone-urgent .priority-pill-dot { background: #F87171; }
+        .blocker-toggles { display: flex; flex-direction: column; gap: 8px; }
+        .blocker-toggle {
+          display: flex; align-items: flex-start; gap: 12px; width: 100%; text-align: left;
+          padding: 12px 14px; border-radius: 10px; border: 1px solid #2A2A36; background: #14141A;
+          cursor: pointer; font-family: inherit; transition: all 0.15s;
+        }
+        .blocker-toggle:hover:not(:disabled) { border-color: #3A3A50; background: #1C1C24; }
+        .blocker-toggle:disabled { cursor: default; opacity: 0.85; }
+        .blocker-toggle-mark {
+          width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
+          border: 1px solid #3A3A50; background: #1C1C24;
+          display: flex; align-items: center; justify-content: center;
+          font-size: 12px; font-weight: 700; color: #F0F0F6;
+        }
+        .blocker-toggle-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+        .blocker-toggle-title { font-size: 13px; font-weight: 600; color: #F0F0F6; line-height: 1.3; }
+        .blocker-toggle-desc { font-size: 11px; color: #56566A; line-height: 1.45; font-weight: 400; }
+        .blocker-toggle.on.sales { border-color: rgba(251,191,36,0.4); background: rgba(251,191,36,0.08); }
+        .blocker-toggle.on.sales .blocker-toggle-mark { border-color: #FBBF24; background: rgba(251,191,36,0.2); color: #FBBF24; }
+        .blocker-toggle.on.licenses { border-color: rgba(139,127,255,0.45); background: rgba(139,127,255,0.08); }
+        .blocker-toggle.on.licenses .blocker-toggle-mark { border-color: #8B7FFF; background: rgba(139,127,255,0.2); color: #8B7FFF; }
 
         /* ── CAT LEGEND ── */
         .cat-legend { display: flex; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
@@ -2491,6 +2772,29 @@ export default function StudioTracker() {
         .card:active { cursor: grabbing; }
         .card-dragging { opacity: 0.2; transform: scale(0.97); }
         .card-drop-target { border-color: #8B7FFF !important; box-shadow: 0 0 0 2px rgba(139,127,255,0.4) !important; }
+        .card-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 7px; }
+        .card-flags.compact { margin-bottom: 5px; }
+        .card-flag {
+          font-size: 9px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+          padding: 3px 7px; border-radius: 5px; line-height: 1.2;
+        }
+        .flag-priority-high { background: rgba(251,191,36,0.18); color: #FBBF24; border: 1px solid rgba(251,191,36,0.4); }
+        .flag-priority-urgent { background: rgba(248,113,113,0.15); color: #F87171; border: 1px solid rgba(248,113,113,0.45); }
+        .flag-sales { background: rgba(251,191,36,0.1); color: #FBBF24; border: 1px dashed rgba(251,191,36,0.45); }
+        .flag-sales-info { background: rgba(251,191,36,0.08); color: #FBBF24; border: 1px solid rgba(251,191,36,0.35); }
+        .flag-licenses { background: rgba(139,127,255,0.14); color: #8B7FFF; border: 1px solid rgba(139,127,255,0.45); }
+        .card-waiting-licenses:not(.card-priority-urgent):not(.card-priority-high) {
+          background: linear-gradient(135deg, #1C1C24 0%, rgba(139,127,255,0.08) 100%);
+          border-color: rgba(139,127,255,0.4) !important;
+        }
+        .card-priority-high { border-color: rgba(251,191,36,0.45) !important; }
+        .card-priority-urgent {
+          border-color: rgba(248,113,113,0.55) !important;
+          box-shadow: 0 0 0 1px rgba(248,113,113,0.2), 0 4px 16px rgba(0,0,0,0.4);
+        }
+        .card-waiting-sales:not(.card-priority-urgent):not(.card-priority-high) {
+          background: linear-gradient(135deg, #1C1C24 0%, rgba(251,191,36,0.06) 100%);
+        }
         .card-new {
           border-color: color-mix(in srgb, var(--cc) 55%, #2A2A36) !important;
           animation: cardNewPulse 2.4s ease-in-out infinite;
@@ -2880,7 +3184,11 @@ export default function StudioTracker() {
           .stats-bar { gap: 8px; }
           .stat { padding: 10px 14px; min-width: 0; flex: 1; }
           .stat-val { font-size: 20px; }
-          .filter-bar { gap: 6px; }
+          .filter-bar { gap: 8px; }
+          .filter-signal-group { width: 100%; flex-direction: column; align-items: flex-start; gap: 8px; padding: 10px 12px; }
+          .signal-chip-row { width: 100%; }
+          .board-callout { flex-direction: column; align-items: stretch; }
+          .board-callout-clear { width: 100%; text-align: center; }
           .ss-topbar .ss-search { width: 100%; }
           .team-strip-top { flex-direction: column; align-items: flex-start; gap: 4px; }
           .board { margin: 0 -16px; padding: 0 16px 16px; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -3002,6 +3310,42 @@ export default function StudioTracker() {
               <div><div className="stat-val" style={{ color: C.red }}>{overdueCount}</div><div className="stat-label">Overdue</div></div>
             </div>
           )}
+          {priorityCount > 0 && (
+            <div
+              className={`stat stat-clickable stat-tone-priority ${boardTagFilter === "priority" ? "on" : ""}`}
+              onClick={() => setBoardTagFilter(f => f === "priority" ? null : "priority")}
+              title="Filter: priority only"
+            >
+              <div><div className="stat-val">{priorityCount}</div><div className="stat-label">Priority</div></div>
+            </div>
+          )}
+          {boardMode === "products" && awaitingSalesCount > 0 && (
+            <div
+              className={`stat stat-clickable stat-tone-sales ${boardTagFilter === "awaiting_sales" ? "on" : ""}`}
+              onClick={() => setBoardTagFilter(f => f === "awaiting_sales" ? null : "awaiting_sales")}
+              title="Filter: awaiting sales"
+            >
+              <div><div className="stat-val">{awaitingSalesCount}</div><div className="stat-label">Awaiting sales</div></div>
+            </div>
+          )}
+          {boardMode === "presentations" && licensesCount > 0 && (
+            <div
+              className={`stat stat-clickable stat-tone-licenses ${boardTagFilter === "licenses" ? "on" : ""}`}
+              onClick={() => setBoardTagFilter(f => f === "licenses" ? null : "licenses")}
+              title="Filter: needs licenses"
+            >
+              <div><div className="stat-val">{licensesCount}</div><div className="stat-label">Needs licenses</div></div>
+            </div>
+          )}
+          {boardMode === "presentations" && presSalesInfoCount > 0 && (
+            <div
+              className={`stat stat-clickable stat-tone-sales ${boardTagFilter === "sales_info" ? "on" : ""}`}
+              onClick={() => setBoardTagFilter(f => f === "sales_info" ? null : "sales_info")}
+              title="Filter: awaiting sales info"
+            >
+              <div><div className="stat-val">{presSalesInfoCount}</div><div className="stat-label">Awaiting info</div></div>
+            </div>
+          )}
           <HeatmapCard projects={projects} />
         </div>
 
@@ -3009,8 +3353,8 @@ export default function StudioTracker() {
         <div className="filter-bar">
           {/* Board mode toggle */}
           <div className="bm-toggle">
-            <button onClick={() => setBoardMode("products")} className={`bm-btn ${boardMode === "products" ? "active" : ""}`}>Products</button>
-            <button onClick={() => setBoardMode("presentations")} className={`bm-btn ${boardMode === "presentations" ? "active pres" : ""}`}>Presentations</button>
+            <button onClick={() => { setBoardMode("products"); setBoardTagFilter(null); }} className={`bm-btn ${boardMode === "products" ? "active" : ""}`}>Products</button>
+            <button onClick={() => { setBoardMode("presentations"); setBoardTagFilter(null); }} className={`bm-btn ${boardMode === "presentations" ? "active pres" : ""}`}>Presentations</button>
           </div>
           <div className="filter-div" />
           {/* Category filter */}
@@ -3022,6 +3366,62 @@ export default function StudioTracker() {
             ))}
           </div>
           <div className="filter-div" />
+          <div className="filter-signal-group">
+            <span className="filter-group-label">Focus</span>
+            <div className="signal-chip-row">
+              {priorityCount > 0 && (
+                <SignalFilterChip
+                  tone="priority"
+                  label="Priority"
+                  count={priorityCount}
+                  active={boardTagFilter === "priority"}
+                  onClick={() => setBoardTagFilter(f => f === "priority" ? null : "priority")}
+                  title="Show priority projects only"
+                />
+              )}
+              {boardMode === "products" && (
+                <SignalFilterChip
+                  tone="sales"
+                  label="Awaiting sales"
+                  count={awaitingSalesCount}
+                  active={boardTagFilter === "awaiting_sales"}
+                  onClick={() => setBoardTagFilter(f => f === "awaiting_sales" ? null : "awaiting_sales")}
+                  title="Show products waiting on sales"
+                />
+              )}
+              {boardMode === "presentations" && (
+                <>
+                  <SignalFilterChip
+                    tone="licenses"
+                    label="Needs licenses"
+                    count={licensesCount}
+                    active={boardTagFilter === "licenses"}
+                    onClick={() => setBoardTagFilter(f => f === "licenses" ? null : "licenses")}
+                    title="Waiting on licenses from sales"
+                  />
+                  <SignalFilterChip
+                    tone="sales"
+                    label="Awaiting info"
+                    count={presSalesInfoCount}
+                    active={boardTagFilter === "sales_info"}
+                    onClick={() => setBoardTagFilter(f => f === "sales_info" ? null : "sales_info")}
+                    title="Waiting on sales brief or details"
+                  />
+                  {presBlockedCount > 0 && (
+                    <SignalFilterChip
+                      tone="blocked"
+                      label="All blocked"
+                      count={presBlockedCount}
+                      active={boardTagFilter === "awaiting_sales"}
+                      onClick={() => setBoardTagFilter(f => f === "awaiting_sales" ? null : "awaiting_sales")}
+                      title="Any sales blocker"
+                    />
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+          <div className="filter-div" />
           <div className="filter-section" style={{ gap: 6 }}>
             {TEAM.map(t => (
               <div key={t.name} title={t.name} className={`asn-chip ${assigneeFilter === t.name ? "asn-on" : ""}`}
@@ -3031,6 +3431,25 @@ export default function StudioTracker() {
             ))}
           </div>
         </div>
+
+        {boardTagFilter && (
+          <div className="board-callout">
+            <div className="board-callout-text">
+              <span className="board-callout-dot" aria-hidden />
+              <span>
+                Filtered to <strong>{
+                  boardTagFilter === "priority" ? "priority"
+                    : boardTagFilter === "licenses" ? "needs licenses"
+                      : boardTagFilter === "sales_info" ? "awaiting sales info"
+                        : boardTagFilter === "awaiting_sales" && boardMode === "presentations" ? "blocked by sales"
+                          : "awaiting sales"
+                }</strong>
+                <span className="board-callout-count">{filtered.filter(p => p.stage !== "archived").length} shown</span>
+              </span>
+            </div>
+            <button type="button" className="board-callout-clear" onClick={() => setBoardTagFilter(null)}>Clear filter</button>
+          </div>
+        )}
 
         {view === "board" ? (
           <Board projects={filtered} onAssign={handleAssign} onReorder={handleReorder} onQuickAdd={handleQuickAdd} onOpen={openProject} stages={activeStages} canEdit={canEditProjects} shouldGlowProject={shouldGlowProject} />
