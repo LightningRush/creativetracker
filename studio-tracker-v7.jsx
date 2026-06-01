@@ -73,11 +73,28 @@ const isWaitingOnSalesInfo = (p) => isPresentationProject(p) && !!p?.waitingOnSa
 const isBlockedBySales = (p) => isWaitingOnSalesProduct(p) || isWaitingOnLicenses(p) || isWaitingOnSalesInfo(p);
 const prioritySortKey = (p) => (p?.priority === "urgent" ? 2 : p?.priority === "high" ? 1 : 0);
 
-function sortProjectsForBoard(items) {
-  return [...items].sort((a, b) => {
-    const pd = prioritySortKey(b) - prioritySortKey(a);
-    if (pd !== 0) return pd;
-    return (a.title || "").localeCompare(b.title || "", undefined, { sensitivity: "base" });
+/** Scroll inside a column only when it has enough cards; empty columns let the page scroll */
+const COL_SCROLL_CARD_THRESHOLD = 3;
+
+/** Preserve manual column order (boardOrder), then array position for legacy rows */
+function orderProjectsForBoard(stageItems, allProjects) {
+  const indexInList = new Map(allProjects.map((p, i) => [p.id, i]));
+  return [...stageItems].sort((a, b) => {
+    const oa = typeof a.boardOrder === "number" ? a.boardOrder : indexInList.get(a.id) ?? 0;
+    const ob = typeof b.boardOrder === "number" ? b.boardOrder : indexInList.get(b.id) ?? 0;
+    if (oa !== ob) return oa - ob;
+    return (indexInList.get(a.id) ?? 0) - (indexInList.get(b.id) ?? 0);
+  });
+}
+
+/** Re-number boardOrder for stages based on current global array order */
+function applyBoardOrderForStages(projects, stageIds) {
+  const counters = {};
+  return projects.map(p => {
+    if (!stageIds.has(p.stage)) return p;
+    const n = counters[p.stage] ?? 0;
+    counters[p.stage] = n + 1;
+    return { ...p, boardOrder: n };
   });
 }
 
@@ -726,6 +743,103 @@ function SignalFilterChip({ active, tone, label, count, onClick, title }) {
   );
 }
 
+function focusFilterLabel(boardTagFilter, boardMode) {
+  if (boardTagFilter === "priority") return "priority";
+  if (boardTagFilter === "licenses") return "needs licenses";
+  if (boardTagFilter === "sales_info") return "awaiting sales info";
+  if (boardTagFilter === "awaiting_sales" && boardMode === "presentations") return "blocked by sales";
+  if (boardTagFilter === "awaiting_sales") return "awaiting sales";
+  return "";
+}
+
+function FocusFilterBar({
+  boardMode,
+  boardTagFilter,
+  setBoardTagFilter,
+  priorityCount,
+  awaitingSalesCount,
+  licensesCount,
+  presSalesInfoCount,
+  presBlockedCount,
+  filteredShownCount = 0,
+  statusAside = false,
+}) {
+  const chips = (
+    <div className={`filter-signal-group ${boardTagFilter ? "has-active-filter" : ""}`}>
+      <span className="filter-group-label">Focus</span>
+      <div className="signal-chip-row">
+        {priorityCount > 0 && (
+          <SignalFilterChip
+            tone="priority"
+            label="Priority"
+            count={priorityCount}
+            active={boardTagFilter === "priority"}
+            onClick={() => setBoardTagFilter(f => f === "priority" ? null : "priority")}
+            title="Show priority projects only"
+          />
+        )}
+        {boardMode === "products" && (
+          <SignalFilterChip
+            tone="sales"
+            label="Awaiting sales"
+            count={awaitingSalesCount}
+            active={boardTagFilter === "awaiting_sales"}
+            onClick={() => setBoardTagFilter(f => f === "awaiting_sales" ? null : "awaiting_sales")}
+            title="Show products waiting on sales"
+          />
+        )}
+        {boardMode === "presentations" && (
+          <>
+            <SignalFilterChip
+              tone="licenses"
+              label="Needs licenses"
+              count={licensesCount}
+              active={boardTagFilter === "licenses"}
+              onClick={() => setBoardTagFilter(f => f === "licenses" ? null : "licenses")}
+              title="Waiting on licenses from sales"
+            />
+            <SignalFilterChip
+              tone="sales"
+              label="Awaiting info"
+              count={presSalesInfoCount}
+              active={boardTagFilter === "sales_info"}
+              onClick={() => setBoardTagFilter(f => f === "sales_info" ? null : "sales_info")}
+              title="Waiting on sales brief or details"
+            />
+            {presBlockedCount > 0 && (
+              <SignalFilterChip
+                tone="blocked"
+                label="All blocked"
+                count={presBlockedCount}
+                active={boardTagFilter === "awaiting_sales"}
+                onClick={() => setBoardTagFilter(f => f === "awaiting_sales" ? null : "awaiting_sales")}
+                title="Any sales blocker"
+              />
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+
+  if (!statusAside) return chips;
+
+  return (
+    <div className="board-focus-wrap">
+      <div
+        className={`focus-filter-status ${boardTagFilter ? "is-visible" : ""}`}
+        title={boardTagFilter ? `Filtered to ${focusFilterLabel(boardTagFilter, boardMode)}` : undefined}
+      >
+        <span className="focus-filter-count">{filteredShownCount} shown</span>
+        <button type="button" className="focus-filter-clear" onClick={() => setBoardTagFilter(null)} tabIndex={boardTagFilter ? 0 : -1}>
+          Clear
+        </button>
+      </div>
+      {chips}
+    </div>
+  );
+}
+
 function BlockerToggle({ checked, onChange, disabled, tone, title, description }) {
   return (
     <button
@@ -790,7 +904,8 @@ function ProjectFlags({ project, compact = false }) {
 }
 
 // ─── BOARD CARD ──────────────────────────────────────────────────────────────
-function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, canEdit = true, isNewHighlight = false }) {
+function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, onDelete, canEdit = true, isNewHighlight = false }) {
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const days    = daysUntil(project.dueDate);
   const overdue = days !== null && days < 0;
   const dueSoon = days !== null && days >= 0 && days <= 14;
@@ -801,13 +916,37 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, c
 
   return (
     <div
-      className={`card ${isDragging ? "card-dragging" : ""} ${isDropTarget ? "card-drop-target" : ""} ${isNewHighlight ? "card-new" : ""} ${!canEdit ? "card-view-only" : ""} ${pr.id ? `card-priority-${pr.id}` : ""} ${licenses ? "card-waiting-licenses" : ""} ${salesHold ? "card-waiting-sales" : ""}`}
+      className={`card ${isDragging ? "card-dragging" : ""} ${isDropTarget ? "card-drop-target" : ""} ${isNewHighlight ? "card-new" : ""} ${confirmDelete ? "card-confirm-delete" : ""} ${!canEdit ? "card-view-only" : ""} ${pr.id ? `card-priority-${pr.id}` : ""} ${licenses ? "card-waiting-licenses" : ""} ${salesHold ? "card-waiting-sales" : ""}`}
       onPointerDown={canEdit ? (e) => onPointerDown(e, project) : undefined}
-      onClick={() => { if (!isDragging) onOpen(project); }}
+      onClick={() => { if (!isDragging && !confirmDelete) onOpen(project); }}
       data-card-id={project.id}
       style={{ "--cc": cc }}
     >
       {isDropTarget && <div className="card-drop-bar" />}
+      {canEdit && onDelete && (
+        <div className="card-actions" onClick={e => e.stopPropagation()}>
+          {!confirmDelete ? (
+            <button
+              type="button"
+              className="card-delete-btn"
+              onClick={() => setConfirmDelete(true)}
+              title="Delete project"
+              aria-label="Delete project"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden>
+                <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" />
+                <path d="M10 11v6M14 11v6" />
+              </svg>
+            </button>
+          ) : (
+            <div className="card-delete-confirm">
+              <span className="card-delete-prompt">Delete?</span>
+              <button type="button" className="card-delete-yes" onClick={() => onDelete(project.id)}>Yes</button>
+              <button type="button" className="card-delete-no" onClick={() => setConfirmDelete(false)}>No</button>
+            </div>
+          )}
+        </div>
+      )}
       <div className="card-stripe" />
       <div className="card-body">
         <ProjectFlags project={project} />
@@ -860,7 +999,7 @@ function QuickAdd({ stageId, onAdd, canEdit = true }) {
 }
 
 // ─── BOARD ───────────────────────────────────────────────────────────────────
-function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STAGES, canEdit = true, shouldGlowProject }) {
+function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, onDelete, stages = STAGES, canEdit = true, shouldGlowProject, focusBar = null }) {
   const isHighlighted = (p) => shouldGlowProject?.(p) ?? false;
   const [drag,      _setDrag]  = useState(null);
   const [hover,     _setHover] = useState(null);
@@ -887,18 +1026,22 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
     return () => document.removeEventListener("touchmove", block);
   }, []);
 
-  // Wheel → horizontal scroll only when the board actually scrolls sideways (mobile)
+  // Wheel: page scroll by default; horizontal pan only when the board overflows sideways
   useEffect(() => {
     const el = boardRef.current;
     if (!el) return;
     const onWheel = (e) => {
       if (isDraggingRef.current) return;
+      if (!e.target.closest?.(".board")) return;
 
-      const colBody = e.target.closest?.(".col-body");
-      if (colBody && colBody.scrollHeight > colBody.clientHeight + 2) {
-        const atTop = colBody.scrollTop <= 0;
-        const atBottom = colBody.scrollTop + colBody.clientHeight >= colBody.scrollHeight - 2;
-        if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
+      const colBody = e.target.closest?.(".col-cards--scroll");
+      if (colBody) {
+        const canScrollY = colBody.scrollHeight > colBody.clientHeight + 2;
+        if (canScrollY) {
+          const atTop = colBody.scrollTop <= 0;
+          const atBottom = colBody.scrollTop + colBody.clientHeight >= colBody.scrollHeight - 2;
+          if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
+        }
       }
 
       const canScrollX = el.scrollWidth > el.clientWidth + 2;
@@ -1022,29 +1165,37 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
 
   return (
     <>
-      {/* Team strip */}
-      <div className="team-strip">
-        <div className="team-strip-top">
+      <div className="board-tools-row">
+        <div className="team-strip">
           <span className="strip-label">Team</span>
-          <span className="strip-hint">{!canEdit ? "View only — click a card for details" : isDC ? "Drop on teammate to add them to the project" : isDT ? "Drop onto a card to add teammate" : "Drag cards to move · drop on teammate to add to project"}</span>
+          <div className="team-row">
+            {TEAM.map(t => {
+              const isChipDrop    = isDC && hover?.type === "assignee" && hover.value === t.name;
+              const isBeingDragged = isDT && drag.name === t.name;
+              return (
+                <div key={t.name} data-assignee={t.name}
+                  onPointerDown={canEdit ? (e) => handleTeamPointerDown(e, t) : undefined}
+                  className={`team-chip ${isChipDrop ? "chip-on" : ""} ${isBeingDragged ? "chip-lifting" : ""} ${!canEdit ? "team-chip-view" : ""}`}
+                  style={{ "--tc": t.color }}
+                >
+                  <span className="av av-sm" style={{ background: t.color }}>{initials(t.name)}</span>
+                  <span className="chip-name">{t.name}</span>
+                  <span className="chip-grip">⠿</span>
+                </div>
+              );
+            })}
+          </div>
+          {(!canEdit || isDC || isDT) && (
+            <span className="strip-hint">
+              {!canEdit
+                ? "View only — click a card for details"
+                : isDC
+                  ? "Drop on teammate to assign"
+                  : "Drop on a card to assign"}
+            </span>
+          )}
         </div>
-        <div className="team-row">
-          {TEAM.map(t => {
-            const isChipDrop    = isDC && hover?.type === "assignee" && hover.value === t.name;
-            const isBeingDragged = isDT && drag.name === t.name;
-            return (
-              <div key={t.name} data-assignee={t.name}
-                onPointerDown={canEdit ? (e) => handleTeamPointerDown(e, t) : undefined}
-                className={`team-chip ${isChipDrop ? "chip-on" : ""} ${isBeingDragged ? "chip-lifting" : ""} ${!canEdit ? "team-chip-view" : ""}`}
-                style={{ "--tc": t.color }}
-              >
-                <span className="av av-sm" style={{ background: t.color }}>{initials(t.name)}</span>
-                <span className="chip-name">{t.name}</span>
-                <span className="chip-grip">⠿</span>
-              </div>
-            );
-          })}
-        </div>
+        {focusBar && <div className="board-tools-focus">{focusBar}</div>}
       </div>
 
       {/* Category legend */}
@@ -1058,13 +1209,17 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
       </div>
 
       {/* Board */}
-      <div className="board" ref={boardRef}>
+      <div className="board scroll-surface" ref={boardRef}>
         {stages.map((stage, si) => {
           const stageIds = new Set(stages.map(s => s.id));
-          const items    = sortProjectsForBoard(projects.filter(p => p.stage === stage.id || (si === 0 && !stageIds.has(p.stage))));
+          const items    = orderProjectsForBoard(
+            projects.filter(p => p.stage === stage.id || (si === 0 && !stageIds.has(p.stage))),
+            projects,
+          );
           const isHov    = isDC && hover?.type === "stage" && hover.value === stage.id;
           const overdueCt = items.filter(p => { const d = daysUntil(p.dueDate); return d !== null && d < 0; }).length;
           const isColl   = collapsed.has(stage.id);
+          const bodyScroll = !isColl && items.length >= COL_SCROLL_CARD_THRESHOLD;
           return (
             <div key={stage.id} className={`col ${isHov ? "col-on" : ""} ${isColl ? "col-collapsed" : ""}`} data-stage={stage.id}>
               <div className="col-head" onClick={() => toggleCollapse(stage.id)}>
@@ -1077,20 +1232,24 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, stages = STA
               </div>
               {!isColl && (
                 <div className="col-body">
-                  {items.length === 0 ? (
-                    <div className={`col-empty ${isHov ? "col-empty-on" : ""}`}>{isHov ? "Drop here" : "No projects"}</div>
-                  ) : items.map(p => {
-                    const isBeforeMarker   = isHov && hover.beforeId === p.id;
-                    const isTeamDropTarget = isDT && hover?.type === "card" && hover.id === p.id;
-                    return (
-                      <div key={p.id}>
-                        {isBeforeMarker && <div className="drop-marker" />}
-                        <BoardCard project={p} isDragging={isDC && drag.project.id === p.id} isDropTarget={isTeamDropTarget} onPointerDown={handleCardPointerDown} onOpen={onOpen} canEdit={canEdit} isNewHighlight={isHighlighted(p)} />
-                      </div>
-                    );
-                  })}
-                  {isHov && !hover.beforeId && items.length > 0 && <div className="drop-marker" />}
-                  <QuickAdd stageId={stage.id} onAdd={onQuickAdd} canEdit={canEdit} />
+                  <div className={`col-cards ${bodyScroll ? "col-cards--scroll scroll-surface" : ""}`}>
+                    {items.length === 0 ? (
+                      <div className={`col-empty ${isHov ? "col-empty-on" : ""}`}>{isHov ? "Drop here" : "No projects"}</div>
+                    ) : items.map(p => {
+                      const isBeforeMarker   = isHov && hover.beforeId === p.id;
+                      const isTeamDropTarget = isDT && hover?.type === "card" && hover.id === p.id;
+                      return (
+                        <div key={p.id}>
+                          {isBeforeMarker && <div className="drop-marker" />}
+                          <BoardCard project={p} isDragging={isDC && drag.project.id === p.id} isDropTarget={isTeamDropTarget} onPointerDown={handleCardPointerDown} onOpen={onOpen} onDelete={onDelete} canEdit={canEdit} isNewHighlight={isHighlighted(p)} />
+                        </div>
+                      );
+                    })}
+                    {isHov && !hover.beforeId && items.length > 0 && <div className="drop-marker" />}
+                  </div>
+                  <div className="col-add">
+                    <QuickAdd stageId={stage.id} onAdd={onQuickAdd} canEdit={canEdit} />
+                  </div>
                 </div>
               )}
             </div>
@@ -1423,13 +1582,6 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
                 </Select>
               </Field>
             )}
-            <Field label="Status Notes" full>
-              <Textarea rows={4} value={form.notes} onChange={e => set("notes", e.target.value)} disabled={readOnly}
-                placeholder="Latest updates, blockers, next steps…" />
-              {form.notes?.trim() && (
-                <div className="notes-rendered"><LinkedText text={form.notes} /></div>
-              )}
-            </Field>
             {!isPresentation && (isAwaitingSales || normalizeStyleEntries(form.styleNumbers).length > 0) && (
               <StyleSkuSection
                 value={form.styleNumbers}
@@ -1437,28 +1589,49 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
                 canEdit={isAwaitingSales && !readOnly}
               />
             )}
+            <Field label="Status Notes" full>
+              <Textarea rows={4} value={form.notes} onChange={e => set("notes", e.target.value)} disabled={readOnly}
+                placeholder="Latest updates, blockers, next steps…" />
+            </Field>
           </div>
-          {!isNew && <ActivityLog activity={form.activity} />}
+
           {!readOnly ? (
-          <div className="drawer-actions">
-            <div className="drawer-actions-row">
-              <button onClick={() => onSave(normalizeProjectForSave({
-                ...form,
-                id: form.id || `p${Date.now()}`,
-                styleNumbers: normalizeStyleEntries(form.styleNumbers),
-              }))} disabled={!form.title.trim()} className="btn-primary">
-                {isNew ? "Create project" : "Save changes"}
-              </button>
-              {!isNew && (
-                confirmDelete
-                  ? <div style={{ display:"flex", gap:8, flex:1 }}>
-                      <button onClick={() => onDelete(form.id)} className="btn-danger" style={{ flex:1 }}>Yes, delete</button>
-                      <button onClick={() => setConfirmDelete(false)} className="btn-cancel">Cancel</button>
-                    </div>
-                  : <button onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
-              )}
+            <div className="drawer-actions drawer-actions-after-notes">
+              <div className="drawer-actions-row">
+                <button onClick={() => onSave(normalizeProjectForSave({
+                  ...form,
+                  id: form.id || `p${Date.now()}`,
+                  styleNumbers: normalizeStyleEntries(form.styleNumbers),
+                }))} disabled={!form.title.trim()} className="btn-primary">
+                  {isNew ? "Create project" : "Save changes"}
+                </button>
+                {!isNew && (
+                  confirmDelete
+                    ? <div className="drawer-delete-confirm">
+                        <button onClick={() => onDelete(form.id)} className="btn-danger" style={{ flex: 1 }}>Yes, delete</button>
+                        <button onClick={() => setConfirmDelete(false)} className="btn-cancel">Cancel</button>
+                      </div>
+                    : <button onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
+                )}
+              </div>
             </div>
-            {!isNew && onMoveBoard && (
+          ) : (
+            <div className="drawer-actions drawer-actions-after-notes">
+              <button onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+            </div>
+          )}
+
+          {form.notes?.trim() && (
+            <div className="drawer-posted-notes">
+              <div className="field-label">Posted notes</div>
+              <div className="notes-rendered"><LinkedText text={form.notes} /></div>
+            </div>
+          )}
+
+          {!isNew && <ActivityLog activity={form.activity} />}
+
+          {!readOnly && !isNew && onMoveBoard && (
+            <div className="drawer-actions drawer-actions-footer">
               <button
                 type="button"
                 className="drawer-move-board"
@@ -1470,11 +1643,6 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
               >
                 {isPresentation ? "Move to Products board" : "Move to Presentations board"}
               </button>
-            )}
-          </div>
-          ) : (
-            <div className="drawer-actions">
-              <button onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
             </div>
           )}
         </div>
@@ -2101,6 +2269,7 @@ export default function StudioTracker() {
   const [projectHighlightSeen, setProjectHighlightSeen] = useState(() => loadProjectHighlightSeen(user?.id));
   const [toast,          setToast]          = useState(null); // { message, onUndo? }
   const toastTimerRef = useRef(null);
+  const undoRef = useRef(null);
 
   useEffect(() => {
     if (user?.id) setProjectHighlightSeen(loadProjectHighlightSeen(user.id));
@@ -2148,19 +2317,47 @@ export default function StudioTracker() {
     toastTimerRef.current = setTimeout(() => setToast(null), 2400);
   }, []);
 
-  const showUndoToast = useCallback((message, onUndo, ms = 5000) => {
+  const showUndoToast = useCallback((message, onUndo, ms = 8000) => {
     clearToastTimer();
     setToast({ message, onUndo });
     toastTimerRef.current = setTimeout(() => setToast(null), ms);
   }, []);
 
+  const pushUndo = useCallback((snapshot, message) => {
+    const undo = async () => {
+      undoRef.current = null;
+      setProjects(snapshot);
+      try {
+        await save(snapshot);
+        flash("Undone");
+      } catch (e) {
+        console.error(e);
+        flash("Could not undo — try again");
+      }
+    };
+    undoRef.current = undo;
+    if (message) showUndoToast(message, undo, 8000);
+  }, [showUndoToast, flash]);
+
   const runUndo = useCallback(() => {
-    if (!toast?.onUndo) return;
-    const undo = toast.onUndo;
+    if (!undoRef.current) return;
     clearToastTimer();
     setToast(null);
-    undo();
-  }, [toast]);
+    undoRef.current();
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key !== "z" || e.shiftKey) return;
+      const el = e.target;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable)) return;
+      if (!undoRef.current) return;
+      e.preventDefault();
+      runUndo();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [runUndo]);
 
   useEffect(() => () => {
     clearToastTimer();
@@ -2247,16 +2444,19 @@ export default function StudioTracker() {
     };
   }, []);
 
-  const saveProjects = useCallback(async (next, msg) => {
+  const saveProjects = useCallback(async (next, opts) => {
+    const message = typeof opts === "string" ? opts : opts?.message;
+    const undoSnapshot = typeof opts === "object" && opts?.undoSnapshot != null ? opts.undoSnapshot : null;
     setProjects(next);
     try {
       await save(next);
-      if (msg) flash(msg);
+      if (undoSnapshot) pushUndo(undoSnapshot, message);
+      else if (message) flash(message);
     } catch (e) {
       console.error(e);
       flash("Could not save — team may not see this change");
     }
-  }, []);
+  }, [pushUndo, flash]);
 
   const handleAssign = useCallback((id, name) => {
     if (!canEditProjects) return;
@@ -2272,19 +2472,23 @@ export default function StudioTracker() {
       assignHighlightFor: [name],
     }), actor);
     const next = projects.map(p => p.id === id ? updated : p);
-    saveProjects(next, `Added ${name} to "${proj.title}"`);
+    saveProjects(next, { message: `Added ${name} to "${proj.title}"`, undoSnapshot: projects });
   }, [projects, saveProjects, actor, canEditProjects]);
 
   const handleReorder = useCallback((id, newStage, beforeId) => {
     if (!canEditProjects) return;
     const proj = projects.find(p => p.id === id);
     if (!proj) return;
+    const prevStage = proj.stage;
     let next = projects.filter(p => p.id !== id);
     const updated = withActivity(proj, { ...proj, stage: newStage }, actor);
     if (beforeId) { const i = next.findIndex(p => p.id === beforeId); next.splice(i >= 0 ? i : next.length, 0, updated); }
     else { const idxs = next.map((p, i) => p.stage === newStage ? i : -1).filter(i => i >= 0); next.splice(idxs.length ? idxs[idxs.length - 1] + 1 : next.length, 0, updated); }
-    const msg = proj.stage !== newStage ? `Moved to ${stageOf(newStage).label}` : null;
-    saveProjects(next, msg);
+    const stagesToRenumber = new Set([newStage]);
+    if (prevStage !== newStage) stagesToRenumber.add(prevStage);
+    next = applyBoardOrderForStages(next, stagesToRenumber);
+    const msg = proj.stage !== newStage ? `Moved to ${stageOf(newStage).label}` : "Reordered";
+    saveProjects(next, { message: msg, undoSnapshot: projects });
   }, [projects, saveProjects, actor, canEditProjects]);
 
   const handleQuickAdd = useCallback((stageId, title) => {
@@ -2293,17 +2497,20 @@ export default function StudioTracker() {
       ? [assigneeFilter]
       : [defaultAssignee(boardProfile)];
     const now = new Date().toISOString();
+    const inStage = projects.filter(p => p.stage === stageId);
+    const maxOrder = inStage.reduce((m, p) => Math.max(m, typeof p.boardOrder === "number" ? p.boardOrder : -1), -1);
     const p = {
       id: `p${Date.now()}`, title, stage: stageId,
       projectType: boardMode === "presentations" ? "presentation" : "product",
       category: categoryFilter !== "all" ? categoryFilter : "apparel",
       assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [],
+      boardOrder: maxOrder + 1,
       highlightAt: now,
       assignHighlightAt: now,
       assignHighlightFor: assignees,
     };
     const created = withActivity(null, p, actor);
-    saveProjects([...projects, created], `Added "${title}"`);
+    saveProjects([...projects, created], { message: `Added "${title}"`, undoSnapshot: projects });
   }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, canEditProjects, actor]);
 
   const handleSave = (data) => {
@@ -2330,7 +2537,7 @@ export default function StudioTracker() {
     });
     const updated = withActivity(prev, payload, actor);
     const next = exists ? projects.map(p => p.id === data.id ? updated : p) : [updated, ...projects];
-    saveProjects(next);
+    saveProjects(next, { undoSnapshot: projects });
     setDrawer(null);
   };
 
@@ -2346,18 +2553,19 @@ export default function StudioTracker() {
     const updated = withActivity(prev, converted, actor);
     const next = projects.map(p => p.id === data.id ? updated : p);
     setBoardMode(targetType === "presentation" ? "presentations" : "products");
-    saveProjects(next, targetType === "presentation" ? "Moved to Presentations" : "Moved to Products");
+    saveProjects(next, {
+      message: targetType === "presentation" ? "Moved to Presentations" : "Moved to Products",
+      undoSnapshot: projects,
+    });
     setDrawer(null);
   };
   const handleDelete = (id) => {
     if (!canEditProjects) return;
     const removed = projects.find(p => p.id === id);
     if (!removed) return;
-    const snapshot = projects;
     const next = projects.filter(p => p.id !== id);
     setDrawer(null);
-    saveProjects(next);
-    showUndoToast(`Deleted “${removed.title}”`, () => saveProjects(snapshot));
+    saveProjects(next, { message: `Deleted “${removed.title}”`, undoSnapshot: projects });
   };
 
   const presentationProjects = projects.filter(p => p.projectType === "presentation");
@@ -2497,9 +2705,57 @@ export default function StudioTracker() {
         body { margin: 0; }
         .app { min-height: 100vh; background: #0C0C10; color: #F0F0F6; font-family: 'Open Sans', sans-serif; -webkit-font-smoothing: antialiased; }
         html { scroll-behavior: smooth; }
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #2A2A36; border-radius: 4px; }
+        * {
+          scrollbar-width: thin;
+          scrollbar-color: rgba(148, 148, 176, 0.45) transparent;
+        }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track {
+          background: transparent;
+          border-radius: 100px;
+        }
+        ::-webkit-scrollbar-thumb {
+          background: rgba(148, 148, 176, 0.35);
+          border-radius: 100px;
+          border: 2px solid transparent;
+          background-clip: padding-box;
+          min-height: 48px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+          background: rgba(139, 127, 255, 0.5);
+          background-clip: padding-box;
+        }
+        ::-webkit-scrollbar-thumb:active {
+          background: rgba(139, 127, 255, 0.75);
+          background-clip: padding-box;
+        }
+        ::-webkit-scrollbar-corner { background: transparent; }
+        .scroll-surface {
+          scrollbar-width: thin;
+          scrollbar-color: rgba(139, 127, 255, 0.45) rgba(255, 255, 255, 0.04);
+        }
+        .scroll-surface::-webkit-scrollbar { width: 7px; height: 7px; }
+        .scroll-surface::-webkit-scrollbar-track {
+          background: rgba(255, 255, 255, 0.04);
+          border-radius: 100px;
+          margin: 4px 0;
+        }
+        .scroll-surface::-webkit-scrollbar-thumb {
+          background: rgba(148, 148, 176, 0.4);
+          border-radius: 100px;
+          border: 2px solid transparent;
+          background-clip: padding-box;
+          min-height: 44px;
+          transition: background 0.2s ease;
+        }
+        .scroll-surface::-webkit-scrollbar-thumb:hover {
+          background: rgba(139, 127, 255, 0.55);
+          background-clip: padding-box;
+        }
+        .scroll-surface::-webkit-scrollbar-thumb:active {
+          background: #8B7FFF;
+          background-clip: padding-box;
+        }
         input::placeholder, textarea::placeholder { color: #56566A; }
         .mono { font-family: monospace; font-size: 11px; color: #56566A; }
         .sep { color: #2A2A36; }
@@ -2578,14 +2834,6 @@ export default function StudioTracker() {
         .stat { background: #14141A; border: 1px solid #2A2A36; border-radius: 10px; padding: 12px 16px; display: flex; align-items: center; gap: 10px; min-width: 110px; transition: border-color 0.15s, background 0.15s; }
         .stat-val { font-size: 22px; font-weight: 700; color: #F0F0F6; line-height: 1; }
         .stat-label { font-size: 11px; color: #56566A; margin-top: 2px; font-weight: 500; }
-        .stat-clickable { cursor: pointer; }
-        .stat-clickable:hover { background: #1C1C24; }
-        .stat-tone-priority .stat-val { color: #FBBF24; }
-        .stat-tone-priority.on { border-color: rgba(248,113,113,0.5); background: rgba(248,113,113,0.06); }
-        .stat-tone-sales .stat-val { color: #FBBF24; }
-        .stat-tone-sales.on { border-color: rgba(251,191,36,0.5); background: rgba(251,191,36,0.06); }
-        .stat-tone-licenses .stat-val { color: #8B7FFF; }
-        .stat-tone-licenses.on { border-color: rgba(139,127,255,0.5); background: rgba(139,127,255,0.08); }
 
         /* ── FILTER BAR ── */
         .filter-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
@@ -2632,25 +2880,30 @@ export default function StudioTracker() {
           background: #2A2A36; color: #9494B0; min-width: 18px; text-align: center;
         }
         .signal-chip.on .signal-count { background: rgba(255,255,255,0.1); color: #F0F0F6; }
-        .board-callout {
-          display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
-          margin-bottom: 14px; padding: 12px 16px; border-radius: 10px;
-          background: #14141A; border: 1px solid #2A2A36;
-          font-size: 13px; color: #9494B0;
+        .filter-signal-group.has-active-filter {
+          border-color: rgba(139,127,255,0.35);
+          box-shadow: inset 0 0 0 1px rgba(139,127,255,0.08);
         }
-        .board-callout-text { display: flex; align-items: center; gap: 10px; min-width: 0; }
-        .board-callout-dot {
-          width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-          background: #8B7FFF; box-shadow: 0 0 0 3px rgba(139,127,255,0.2);
+        .board-focus-wrap {
+          display: flex; align-items: center; gap: 10px;
+          flex: 0 1 auto; max-width: 100%;
         }
-        .board-callout strong { color: #F0F0F6; font-weight: 600; }
-        .board-callout-count { display: block; font-size: 11px; color: #56566A; margin-top: 2px; font-weight: 500; }
-        .board-callout-clear {
-          padding: 7px 14px; border-radius: 8px; border: 1px solid #2A2A36; background: #1C1C24;
-          color: #9494B0; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit;
-          transition: all 0.15s; flex-shrink: 0;
+        .focus-filter-status {
+          flex: 0 0 96px;
+          width: 96px;
+          display: flex; align-items: center; justify-content: flex-end;
+          gap: 6px; font-size: 10px; color: #56566A; white-space: nowrap;
+          opacity: 0; pointer-events: none;
+          transition: opacity 0.15s;
         }
-        .board-callout-clear:hover { border-color: #8B7FFF55; color: #F0F0F6; background: #23232D; }
+        .focus-filter-status.is-visible { opacity: 1; pointer-events: auto; }
+        .focus-filter-count { font-weight: 600; }
+        .focus-filter-clear {
+          background: none; border: none; padding: 0;
+          font-size: 10px; font-weight: 700; color: #8B7FFF;
+          cursor: pointer; font-family: inherit; line-height: 1;
+        }
+        .focus-filter-clear:hover { color: #F0F0F6; text-decoration: underline; }
         .priority-pills {
           display: flex; gap: 6px; flex-wrap: wrap;
           background: #14141A; border: 1px solid #2A2A36; border-radius: 10px; padding: 4px;
@@ -2700,27 +2953,54 @@ export default function StudioTracker() {
         .cat-chip { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; padding: 2px 7px; border-radius: 4px; }
         .cat-chip.sm { font-size: 10px; }
 
+        /* ── BOARD TOOLS (team + focus) ── */
+        .board-tools-row {
+          display: flex; align-items: center; justify-content: space-between;
+          gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
+        }
+        .board-tools-row .team-strip { margin-bottom: 0; }
+        .board-tools-focus { margin-left: auto; flex: 0 1 auto; max-width: 100%; }
+        .board-tools-focus .board-focus-wrap { margin: 0; }
+        .board-tools-focus .filter-signal-group { margin: 0; }
+
         /* ── TEAM STRIP ── */
-        .team-strip { background: #14141A; border: 1px solid #2A2A36; border-radius: 12px; padding: 12px 16px; margin-bottom: 12px; }
-        .team-strip-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-        .strip-label { font-size: 10px; letter-spacing: 0.1em; color: #56566A; text-transform: uppercase; font-weight: 700; }
-        .strip-hint { font-size: 11px; color: #56566A; }
-        .team-row { display: flex; gap: 8px; flex-wrap: wrap; }
-        .team-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px 5px 5px; background: #1C1C24; border: 1px solid #2A2A36; border-radius: 100px; font-size: 12px; color: #9494B0; cursor: grab; transition: all 0.15s; user-select: none; -webkit-user-select: none; touch-action: none; }
+        .team-strip {
+          display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px 8px;
+          width: fit-content; max-width: 100%;
+          background: #14141A; border: 1px solid #2A2A36; border-radius: 10px;
+          padding: 6px 10px; margin-bottom: 8px;
+        }
+        .strip-label {
+          font-size: 9px; letter-spacing: 0.08em; color: #56566A; text-transform: uppercase;
+          font-weight: 700; flex-shrink: 0; padding-right: 2px;
+        }
+        .strip-hint {
+          font-size: 10px; color: #56566A; line-height: 1.2;
+          flex: 0 1 auto; max-width: 100%;
+        }
+        .team-row { display: flex; gap: 5px; flex-wrap: wrap; flex: 0 1 auto; }
+        .team-strip .av-sm { width: 18px; height: 18px; font-size: 8px; }
+        .team-chip {
+          display: inline-flex; align-items: center; gap: 4px;
+          padding: 3px 8px 3px 3px; background: #1C1C24; border: 1px solid #2A2A36;
+          border-radius: 100px; font-size: 11px; color: #9494B0; cursor: grab;
+          transition: all 0.15s; user-select: none; -webkit-user-select: none; touch-action: none;
+        }
         .team-chip:hover { border-color: #3A3A50; color: #F0F0F6; }
         .team-chip:active { cursor: grabbing; }
-        .chip-on { border-color: var(--tc) !important; background: #1C1C24 !important; box-shadow: 0 0 0 3px color-mix(in srgb, var(--tc) 20%, transparent) !important; transform: scale(1.04); color: #F0F0F6 !important; }
+        .chip-on { border-color: var(--tc) !important; background: #1C1C24 !important; box-shadow: 0 0 0 2px color-mix(in srgb, var(--tc) 20%, transparent) !important; transform: scale(1.02); color: #F0F0F6 !important; }
         .chip-lifting { opacity: 0.25; transform: scale(0.95); }
-        .chip-name { font-weight: 600; font-size: 12px; }
-        .chip-grip { font-size: 11px; color: #3A3A50; }
+        .chip-name { font-weight: 600; font-size: 11px; }
+        .chip-grip { font-size: 9px; color: #3A3A50; line-height: 1; }
 
         /* ── BOARD ── */
         .board {
           display: flex;
           flex-wrap: wrap;
           gap: 12px;
-          padding-bottom: 16px;
+          padding-bottom: 20px;
           align-items: stretch;
+          scrollbar-gutter: stable;
         }
         .col {
           flex: 0 0 calc(25% - 9px);
@@ -2736,19 +3016,35 @@ export default function StudioTracker() {
           min-height: 0;
         }
         .col-body {
+          display: flex; flex-direction: column;
+          flex: 1; min-height: 0;
+          gap: 8px; overflow: visible;
+        }
+        .col-cards {
           display: flex; flex-direction: column; gap: 8px;
-          flex: 1;
-          min-height: 0;
-          max-height: min(70vh, calc(100dvh - 300px));
+          flex: 1 1 auto; min-height: 0;
+          overflow: visible;
+        }
+        .col-cards--scroll {
+          max-height: min(52vh, calc(100dvh - 380px));
           overflow-y: auto;
           overflow-x: hidden;
           overscroll-behavior: contain;
           -webkit-overflow-scrolling: touch;
           scrollbar-gutter: stable;
+          padding-right: 6px;
+          margin-right: -2px;
+          box-sizing: border-box;
         }
+        .col-add {
+          flex-shrink: 0;
+          padding-top: 6px;
+          border-top: 1px solid #1E1E28;
+        }
+        .col-add:empty { display: none; padding: 0; border: none; }
 
         /* ── COLUMNS ── */
-        .col { background: #14141A; border: 1px solid #1E1E28; border-radius: 12px; padding: 10px; transition: background 0.15s, border-color 0.15s; overflow: visible; }
+        .col { background: #14141A; border: 1px solid #1E1E28; border-radius: 12px; padding: 10px 12px 10px 10px; transition: background 0.15s, border-color 0.15s; overflow: visible; }
         .col-on { background: #1C1C28; border-color: #8B7FFF44; box-shadow: inset 0 0 0 1px #8B7FFF44; }
         .col-collapsed { flex: 0 0 auto; min-width: 140px; }
         .col-head { display: flex; align-items: center; gap: 7px; padding: 5px 6px 10px; cursor: pointer; user-select: none; }
@@ -2767,9 +3063,9 @@ export default function StudioTracker() {
         .team-chip-view .chip-grip { display: none; }
         .ui-input:disabled, .ui-select:disabled, .ui-textarea:disabled { opacity: 0.85; cursor: default; }
         .card { background: #1C1C24; border: 1px solid #2A2A36; border-radius: 10px; position: relative; cursor: grab; display: flex; width: 100%; transition: box-shadow 0.15s, border-color 0.15s, opacity 0.15s, transform 0.1s; user-select: none; -webkit-user-select: none; touch-action: pan-y; }
-        .card.card-dragging { touch-action: none; }
         .card:hover { border-color: #3A3A50; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
         .card:active { cursor: grabbing; }
+        .card.card-dragging { touch-action: none; }
         .card-dragging { opacity: 0.2; transform: scale(0.97); }
         .card-drop-target { border-color: #8B7FFF !important; box-shadow: 0 0 0 2px rgba(139,127,255,0.4) !important; }
         .card-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 7px; }
@@ -2815,7 +3111,40 @@ export default function StudioTracker() {
         }
         .card-stripe { width: 3px; flex-shrink: 0; background: var(--cc); border-radius: 9px 0 0 9px; }
         .card-drop-bar { position: absolute; top: 0; left: 0; right: 0; height: 2px; background: #8B7FFF; border-radius: 9px 9px 0 0; pointer-events: none; }
-        .card-body { padding: 11px 12px; flex: 1; min-width: 0; }
+        .card-actions {
+          position: absolute; top: 7px; right: 7px; z-index: 4;
+          display: flex; align-items: center; pointer-events: auto;
+        }
+        .card-delete-btn {
+          width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+          border-radius: 7px; border: 1px solid transparent;
+          background: rgba(12, 12, 16, 0.72); color: #56566A;
+          cursor: pointer; padding: 0; font-family: inherit;
+          opacity: 0.65; transition: opacity 0.15s, color 0.15s, border-color 0.15s, background 0.15s;
+        }
+        @media (hover: hover) {
+          .card-delete-btn { opacity: 0; }
+          .card:hover .card-delete-btn, .card-confirm-delete .card-delete-btn { opacity: 1; }
+        }
+        .card-delete-btn:hover { color: #F87171; border-color: rgba(248,113,113,0.35); background: rgba(248,113,113,0.12); }
+        .card-delete-confirm {
+          display: flex; align-items: center; gap: 5px;
+          padding: 4px 6px; border-radius: 8px;
+          background: #14141A; border: 1px solid rgba(248,113,113,0.4);
+          box-shadow: 0 4px 16px rgba(0,0,0,0.45);
+        }
+        .card-delete-prompt { font-size: 10px; font-weight: 700; color: #F87171; white-space: nowrap; }
+        .card-delete-yes, .card-delete-no {
+          border: none; border-radius: 5px; padding: 3px 7px;
+          font-size: 10px; font-weight: 700; cursor: pointer; font-family: inherit;
+        }
+        .card-delete-yes { background: rgba(248,113,113,0.2); color: #F87171; }
+        .card-delete-yes:hover { background: rgba(248,113,113,0.35); }
+        .card-delete-no { background: #1C1C24; color: #9494B0; }
+        .card-delete-no:hover { color: #F0F0F6; }
+        .card-confirm-delete { border-color: rgba(248,113,113,0.45) !important; }
+        .card-body { padding: 11px 28px 11px 12px; flex: 1; min-width: 0; }
+        .card-view-only .card-body { padding-right: 12px; }
         .card-title { font-size: 13px; font-weight: 600; color: #F0F0F6; line-height: 1.4; margin-bottom: 7px; }
         .card-tags { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
         .card-sku-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
@@ -2835,7 +3164,17 @@ export default function StudioTracker() {
         .sku-add-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
         .sku-add-row .ui-input { min-width: 0; }
         .sku-empty-hint { font-size: 12px; color: #56566A; margin-bottom: 10px; }
-        .notes-rendered { margin-top: 10px; padding-top: 10px; border-top: 1px solid #2A2A36; font-size: 13px; line-height: 1.55; color: #9494B0; }
+        .drawer-posted-notes { margin-top: 4px; margin-bottom: 20px; }
+        .drawer-posted-notes .field-label { margin-bottom: 8px; }
+        .drawer-posted-notes .notes-rendered {
+          padding: 12px 14px; border-radius: 10px;
+          background: #14141A; border: 1px solid #2A2A36;
+          font-size: 13px; line-height: 1.55; color: #9494B0;
+        }
+        .drawer-actions-after-notes { margin-top: 16px; margin-bottom: 8px; }
+        .drawer-actions-footer { margin-top: 16px; margin-bottom: 0; }
+        .drawer-delete-confirm { display: flex; gap: 8px; flex: 1; }
+        .notes-rendered { font-size: 13px; line-height: 1.55; color: #9494B0; }
         .text-link { color: #8B7FFF; text-decoration: underline; text-underline-offset: 2px; }
         .text-link:hover { color: #A89FFF; }
         .linked-text { white-space: pre-wrap; word-break: break-word; }
@@ -2865,9 +3204,9 @@ export default function StudioTracker() {
         .unsync-dot { width: 5px; height: 5px; border-radius: 50%; background: #FB923C; }
 
         /* ── QUICK ADD ── */
-        .qa-btn { width: 100%; margin-top: auto; padding: 8px 10px; background: transparent; border: 1px dashed #2A2A36; border-radius: 8px; font-size: 12px; color: #3A3A50; cursor: pointer; text-align: left; font-family: inherit; transition: all 0.15s; display: flex; align-items: center; gap: 6px; }
+        .qa-btn { width: 100%; padding: 8px 10px; background: transparent; border: 1px dashed #2A2A36; border-radius: 8px; font-size: 12px; color: #3A3A50; cursor: pointer; text-align: left; font-family: inherit; transition: all 0.15s; display: flex; align-items: center; gap: 6px; }
         .qa-btn:hover { background: rgba(139,127,255,0.06); color: #8B7FFF; border-color: rgba(139,127,255,0.3); }
-        .qa-wrap { margin-top: auto; position: relative; }
+        .qa-wrap { position: relative; }
         .qa-input { width: 100%; background: #23232D; border: 2px solid #8B7FFF; border-radius: 8px; padding: 8px 36px 8px 10px; font-size: 13px; color: #F0F0F6; outline: none; font-family: 'Open Sans', sans-serif; font-weight: 600; box-sizing: border-box; }
         .qa-hint { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 10px; color: #56566A; pointer-events: none; }
 
@@ -2922,7 +3261,7 @@ export default function StudioTracker() {
         .eyebrow { font-size: 10px; letter-spacing: 0.12em; color: #56566A; text-transform: uppercase; font-weight: 700; }
         .close-btn { background: none; border: none; font-size: 18px; color: #56566A; cursor: pointer; width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
         .close-btn:hover { background: #1C1C24; color: #F0F0F6; }
-        .drawer-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 24px; }
+        .drawer-actions { display: flex; flex-direction: column; gap: 10px; }
         .drawer-actions-row { display: flex; gap: 10px; width: 100%; }
         .drawer-move-board {
           width: 100%; padding: 13px 18px;
@@ -2945,7 +3284,7 @@ export default function StudioTracker() {
         input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.4); cursor: pointer; }
         .sync-toggle { display: flex; align-items: center; gap: 10px; margin-top: 20px; font-size: 13px; color: #9494B0; cursor: pointer; }
         .sync-toggle input { accent-color: #8B7FFF; width: 16px; height: 16px; }
-        .activity-log { margin-top: 20px; padding-top: 16px; border-top: 1px solid #2A2A36; }
+        .activity-log { margin-top: 4px; margin-bottom: 20px; padding-top: 16px; border-top: 1px solid #2A2A36; }
         .activity-list { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
         .activity-item { padding: 8px 10px; background: #14141A; border-radius: 8px; border: 1px solid #1E1E28; }
         .activity-text { font-size: 12px; color: #F0F0F6; line-height: 1.4; }
@@ -3187,11 +3526,20 @@ export default function StudioTracker() {
           .filter-bar { gap: 8px; }
           .filter-signal-group { width: 100%; flex-direction: column; align-items: flex-start; gap: 8px; padding: 10px 12px; }
           .signal-chip-row { width: 100%; }
-          .board-callout { flex-direction: column; align-items: stretch; }
-          .board-callout-clear { width: 100%; text-align: center; }
           .ss-topbar .ss-search { width: 100%; }
-          .team-strip-top { flex-direction: column; align-items: flex-start; gap: 4px; }
-          .board { margin: 0 -16px; padding: 0 16px 16px; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+          .board-tools-row { flex-direction: column; align-items: stretch; }
+          .board-tools-focus { margin-left: 0; width: 100%; }
+          .team-strip { gap: 5px 6px; padding: 6px 8px; }
+          .strip-hint { flex: 1 1 100%; }
+          .board {
+            margin: 0 -16px;
+            padding: 0 20px 28px 16px;
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-gutter: stable;
+          }
+          .col { padding: 10px 12px; }
           .col { flex: 0 0 252px; }
           .list-row { grid-template-columns: 3px 1fr auto; grid-template-rows: auto auto; }
           .list-main { grid-column: 2; grid-row: 1; }
@@ -3310,42 +3658,6 @@ export default function StudioTracker() {
               <div><div className="stat-val" style={{ color: C.red }}>{overdueCount}</div><div className="stat-label">Overdue</div></div>
             </div>
           )}
-          {priorityCount > 0 && (
-            <div
-              className={`stat stat-clickable stat-tone-priority ${boardTagFilter === "priority" ? "on" : ""}`}
-              onClick={() => setBoardTagFilter(f => f === "priority" ? null : "priority")}
-              title="Filter: priority only"
-            >
-              <div><div className="stat-val">{priorityCount}</div><div className="stat-label">Priority</div></div>
-            </div>
-          )}
-          {boardMode === "products" && awaitingSalesCount > 0 && (
-            <div
-              className={`stat stat-clickable stat-tone-sales ${boardTagFilter === "awaiting_sales" ? "on" : ""}`}
-              onClick={() => setBoardTagFilter(f => f === "awaiting_sales" ? null : "awaiting_sales")}
-              title="Filter: awaiting sales"
-            >
-              <div><div className="stat-val">{awaitingSalesCount}</div><div className="stat-label">Awaiting sales</div></div>
-            </div>
-          )}
-          {boardMode === "presentations" && licensesCount > 0 && (
-            <div
-              className={`stat stat-clickable stat-tone-licenses ${boardTagFilter === "licenses" ? "on" : ""}`}
-              onClick={() => setBoardTagFilter(f => f === "licenses" ? null : "licenses")}
-              title="Filter: needs licenses"
-            >
-              <div><div className="stat-val">{licensesCount}</div><div className="stat-label">Needs licenses</div></div>
-            </div>
-          )}
-          {boardMode === "presentations" && presSalesInfoCount > 0 && (
-            <div
-              className={`stat stat-clickable stat-tone-sales ${boardTagFilter === "sales_info" ? "on" : ""}`}
-              onClick={() => setBoardTagFilter(f => f === "sales_info" ? null : "sales_info")}
-              title="Filter: awaiting sales info"
-            >
-              <div><div className="stat-val">{presSalesInfoCount}</div><div className="stat-label">Awaiting info</div></div>
-            </div>
-          )}
           <HeatmapCard projects={projects} />
         </div>
 
@@ -3365,62 +3677,22 @@ export default function StudioTracker() {
               </button>
             ))}
           </div>
-          <div className="filter-div" />
-          <div className="filter-signal-group">
-            <span className="filter-group-label">Focus</span>
-            <div className="signal-chip-row">
-              {priorityCount > 0 && (
-                <SignalFilterChip
-                  tone="priority"
-                  label="Priority"
-                  count={priorityCount}
-                  active={boardTagFilter === "priority"}
-                  onClick={() => setBoardTagFilter(f => f === "priority" ? null : "priority")}
-                  title="Show priority projects only"
-                />
-              )}
-              {boardMode === "products" && (
-                <SignalFilterChip
-                  tone="sales"
-                  label="Awaiting sales"
-                  count={awaitingSalesCount}
-                  active={boardTagFilter === "awaiting_sales"}
-                  onClick={() => setBoardTagFilter(f => f === "awaiting_sales" ? null : "awaiting_sales")}
-                  title="Show products waiting on sales"
-                />
-              )}
-              {boardMode === "presentations" && (
-                <>
-                  <SignalFilterChip
-                    tone="licenses"
-                    label="Needs licenses"
-                    count={licensesCount}
-                    active={boardTagFilter === "licenses"}
-                    onClick={() => setBoardTagFilter(f => f === "licenses" ? null : "licenses")}
-                    title="Waiting on licenses from sales"
-                  />
-                  <SignalFilterChip
-                    tone="sales"
-                    label="Awaiting info"
-                    count={presSalesInfoCount}
-                    active={boardTagFilter === "sales_info"}
-                    onClick={() => setBoardTagFilter(f => f === "sales_info" ? null : "sales_info")}
-                    title="Waiting on sales brief or details"
-                  />
-                  {presBlockedCount > 0 && (
-                    <SignalFilterChip
-                      tone="blocked"
-                      label="All blocked"
-                      count={presBlockedCount}
-                      active={boardTagFilter === "awaiting_sales"}
-                      onClick={() => setBoardTagFilter(f => f === "awaiting_sales" ? null : "awaiting_sales")}
-                      title="Any sales blocker"
-                    />
-                  )}
-                </>
-              )}
-            </div>
-          </div>
+          {view !== "board" && (
+            <>
+              <div className="filter-div" />
+              <FocusFilterBar
+                boardMode={boardMode}
+                boardTagFilter={boardTagFilter}
+                setBoardTagFilter={setBoardTagFilter}
+                priorityCount={priorityCount}
+                awaitingSalesCount={awaitingSalesCount}
+                licensesCount={licensesCount}
+                presSalesInfoCount={presSalesInfoCount}
+                presBlockedCount={presBlockedCount}
+                filteredShownCount={activeCount}
+              />
+            </>
+          )}
           <div className="filter-div" />
           <div className="filter-section" style={{ gap: 6 }}>
             {TEAM.map(t => (
@@ -3432,27 +3704,32 @@ export default function StudioTracker() {
           </div>
         </div>
 
-        {boardTagFilter && (
-          <div className="board-callout">
-            <div className="board-callout-text">
-              <span className="board-callout-dot" aria-hidden />
-              <span>
-                Filtered to <strong>{
-                  boardTagFilter === "priority" ? "priority"
-                    : boardTagFilter === "licenses" ? "needs licenses"
-                      : boardTagFilter === "sales_info" ? "awaiting sales info"
-                        : boardTagFilter === "awaiting_sales" && boardMode === "presentations" ? "blocked by sales"
-                          : "awaiting sales"
-                }</strong>
-                <span className="board-callout-count">{filtered.filter(p => p.stage !== "archived").length} shown</span>
-              </span>
-            </div>
-            <button type="button" className="board-callout-clear" onClick={() => setBoardTagFilter(null)}>Clear filter</button>
-          </div>
-        )}
-
         {view === "board" ? (
-          <Board projects={filtered} onAssign={handleAssign} onReorder={handleReorder} onQuickAdd={handleQuickAdd} onOpen={openProject} stages={activeStages} canEdit={canEditProjects} shouldGlowProject={shouldGlowProject} />
+          <Board
+            projects={filtered}
+            onAssign={handleAssign}
+            onReorder={handleReorder}
+            onQuickAdd={handleQuickAdd}
+            onDelete={handleDelete}
+            onOpen={openProject}
+            stages={activeStages}
+            canEdit={canEditProjects}
+            shouldGlowProject={shouldGlowProject}
+            focusBar={
+              <FocusFilterBar
+                boardMode={boardMode}
+                boardTagFilter={boardTagFilter}
+                setBoardTagFilter={setBoardTagFilter}
+                priorityCount={priorityCount}
+                awaitingSalesCount={awaitingSalesCount}
+                licensesCount={licensesCount}
+                presSalesInfoCount={presSalesInfoCount}
+                presBlockedCount={presBlockedCount}
+                filteredShownCount={activeCount}
+                statusAside
+              />
+            }
+          />
         ) : view === "list" ? (
           <ListView projects={filtered.filter(p => p.stage !== "archived")} onOpen={openProject} shouldGlowProject={shouldGlowProject} />
         ) : (
