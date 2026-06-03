@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback, useRef, Fragment } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from "react";
 import { UserButton } from "@clerk/clerk-react";
 import { useAppRole, useNickname } from "./src/useAppRole.js";
+import SalesPage, { computeOverview, computeWorkload } from "./src/SalesPage.jsx";
 
 const MAX_ACTIVITY = 50;
 
@@ -196,7 +197,13 @@ function projectHighlightSeenKeys(project) {
   return keys;
 }
 
-const SEASONS = ["SS25", "FW25", "SS26", "FW26", "Resort 26", "Evergreen"];
+const SEASONS = [
+  "SS25", "FW25", "Resort 25",
+  "SS26", "FW26", "Resort 26",
+  "SS27", "FW27", "Resort 27",
+  "SS28", "FW28", "Resort 28",
+  "Evergreen",
+];
 
 const SEED = [];
 
@@ -471,6 +478,140 @@ function withLicActivity(prev, next, by, projects) {
   return { ...next, activity };
 }
 
+const SALES_REQ_STATUS = {
+  pending:  { id: "pending",  label: "Pending",  dot: "#FBBF24" },
+  approved: { id: "approved", label: "Approved", dot: "#34D399" },
+  rejected: { id: "rejected", label: "Rejected", dot: "#F87171" },
+};
+const SALES_REQ_COLUMNS = [
+  { ...SALES_REQ_STATUS.pending, label: "Pending review", hint: "Waiting on art" },
+  { ...SALES_REQ_STATUS.approved, label: "Approved", hint: "Art accepted" },
+  { ...SALES_REQ_STATUS.rejected, label: "Rejected", hint: "Not taken on" },
+];
+const salesReqStatusOf = (id) => SALES_REQ_STATUS[id] || SALES_REQ_STATUS.pending;
+
+function diffSalesReqActivity(prev, next, by, projects) {
+  if (!prev) return [newActivityEntry(by, "Submitted request")];
+  const entries = [];
+  const prevSt = prev.status || "pending";
+  const nextSt = next.status || "pending";
+  if (prevSt !== nextSt) {
+    entries.push(newActivityEntry(by, `${salesReqStatusOf(nextSt).label}`));
+  }
+  if ((prev.title || "").trim() !== (next.title || "").trim()) {
+    entries.push(newActivityEntry(by, `Title → “${next.title}”`));
+  }
+  if ((prev.category || "") !== (next.category || "")) {
+    entries.push(newActivityEntry(by, `Category → ${catLabel(next.category)}`));
+  }
+  if ((prev.season || "") !== (next.season || "")) {
+    entries.push(newActivityEntry(by, `Season → ${next.season}`));
+  }
+  if ((prev.projectId || "") !== (next.projectId || "")) {
+    const title = next.projectId ? (projects?.find(p => p.id === next.projectId)?.title || "a project") : "";
+    entries.push(newActivityEntry(by, next.projectId ? `Linked to ${title}` : "Unlinked project"));
+  }
+  if ((prev.message || "").trim() !== (next.message || "").trim()) {
+    entries.push(newActivityEntry(by, "Updated request details"));
+  }
+  if ((prev.reviewNote || "").trim() !== (next.reviewNote || "").trim()) {
+    entries.push(newActivityEntry(by, "Updated art team note"));
+  }
+  if ((prev.createdProjectId || "") !== (next.createdProjectId || "")) {
+    const title = next.createdProjectId
+      ? (projects?.find(p => p.id === next.createdProjectId)?.title || "project")
+      : "";
+    entries.push(newActivityEntry(by, next.createdProjectId ? `Added to board: ${title}` : "Removed board link"));
+  }
+  if ((prev.createdBoardType || "") !== (next.createdBoardType || "") && next.createdBoardType) {
+    entries.push(newActivityEntry(by, `Board → ${boardTypeLabel(next.createdBoardType)}`));
+  }
+  return entries;
+}
+
+function withSalesReqActivity(prev, next, by, projects) {
+  const added = diffSalesReqActivity(prev, next, by, projects);
+  if (!added.length) return next;
+  const activity = [...added, ...(next.activity || prev?.activity || [])].slice(0, MAX_ACTIVITY);
+  return { ...next, activity };
+}
+
+function defaultStageForSalesBoard(boardType) {
+  return boardType === "presentation" ? "brief" : "concept";
+}
+
+function boardTypeLabel(boardType) {
+  return boardType === "presentation" ? "Presentations" : "Products";
+}
+
+function buildProjectFromSalesRequest(req, boardType, projects, actor, teamProfile) {
+  const projectType = boardType === "presentation" ? "presentation" : "product";
+  const stage = defaultStageForSalesBoard(boardType);
+  const now = new Date().toISOString();
+  const inStage = projects.filter(p => p.stage === stage);
+  const maxOrder = inStage.reduce((m, p) => Math.max(m, typeof p.boardOrder === "number" ? p.boardOrder : -1), -1);
+  const assignees = [defaultAssignee(teamProfile)];
+  const noteLines = [];
+  if (req.message?.trim()) noteLines.push(`Sales request:\n${req.message.trim()}`);
+  if (req.reviewNote?.trim()) noteLines.push(`Art note:\n${req.reviewNote.trim()}`);
+  if (req.createdBy) noteLines.push(`Submitted by ${req.createdBy}`);
+  const linked = req.projectId ? projects.find(p => p.id === req.projectId) : null;
+  if (linked) noteLines.push(`Related project: ${linked.title}`);
+
+  const base = {
+    id: `p${Date.now()}`,
+    title: (req.title || "").trim() || "Untitled",
+    stage,
+    projectType,
+    category: req.category || "apparel",
+    season: req.season || "SS26",
+    assignees,
+    dueDate: "",
+    notes: noteLines.join("\n\n"),
+    styleNumbers: [],
+    activity: [],
+    boardOrder: maxOrder + 1,
+    salesRequestId: req.id,
+    highlightAt: now,
+    assignHighlightAt: now,
+    assignHighlightFor: assignees,
+  };
+  const withCreate = withActivity(null, base, actor);
+  return {
+    ...withCreate,
+    activity: [
+      newActivityEntry(actor, `Created from sales request (${req.createdBy || "Sales"})`),
+      ...(withCreate.activity || []),
+    ].slice(0, MAX_ACTIVITY),
+  };
+}
+
+function upsertProjectForSalesRequest(req, boardType, projects, actor, teamProfile) {
+  const targetType = boardType === "presentation" ? "presentation" : "product";
+  let projectId = req.createdProjectId;
+  let proj = projectId ? projects.find(p => p.id === projectId) : null;
+
+  if (!proj) {
+    const created = buildProjectFromSalesRequest(req, boardType, projects, actor, teamProfile);
+    return { nextProjects: [...projects, created], projectId: created.id, created: true, title: created.title };
+  }
+
+  const currentType = proj.projectType === "presentation" ? "presentation" : "product";
+  if (currentType !== targetType) {
+    const moved = convertProjectBetweenBoards(proj, targetType);
+    const updated = withActivity(proj, moved, actor);
+    return {
+      nextProjects: projects.map(p => p.id === proj.id ? updated : p),
+      projectId: proj.id,
+      created: false,
+      title: updated.title,
+      moved: true,
+    };
+  }
+
+  return { nextProjects: projects, projectId: proj.id, created: false, title: proj.title };
+}
+
 const LINK_MARKDOWN_RE = /\[([^\]]+)\]\(([^)]+)\)|(https?:\/\/[^\s<>"{}|\\^`[\]]+)/g;
 
 function LinkedText({ text, className = "" }) {
@@ -599,6 +740,8 @@ const licTypeOf = (id) => LIC_TYPES.find(t => t.id === id) || LIC_TYPES[0];
 
 async function loadLic() { try { const r = await window.storage.get("lic_v1"); return r ? JSON.parse(r.value) : []; } catch { return []; } }
 async function saveLic(reqs) { await window.storage.set("lic_v1", JSON.stringify(reqs)); }
+async function loadSalesReq() { try { const r = await window.storage.get("sales_req_v1"); return r ? JSON.parse(r.value) : []; } catch { return []; } }
+async function saveSalesReq(reqs) { await window.storage.set("sales_req_v1", JSON.stringify(reqs)); }
 
 function AssigneeAvatars({ project, size = "sm", maxShow = 3, compact = false }) {
   const names = projectAssignees(project);
@@ -1504,9 +1647,9 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
           </div>
 
           {isNew && !readOnly && (
-            <div className="ss-type-toggle" style={{ marginBottom: 16 }}>
-              <button onClick={() => { set("projectType","product"); set("stage","concept"); }} className={`ss-type-btn ${!isPresentation ? "active" : ""}`}>Product</button>
-              <button onClick={() => { set("projectType","presentation"); set("stage","brief"); }} className={`ss-type-btn ${isPresentation ? "active" : ""}`}>Presentation</button>
+            <div className="seg-toggle seg-toggle--2 drawer-type-toggle">
+              <button type="button" onClick={() => { set("projectType","product"); set("stage","concept"); }} className={`seg-btn ${!isPresentation ? "active" : ""}`}>Product</button>
+              <button type="button" onClick={() => { set("projectType","presentation"); set("stage","brief"); }} className={`seg-btn ${isPresentation ? "active pres" : ""}`}>Presentation</button>
             </div>
           )}
 
@@ -1520,10 +1663,27 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
                 {stageOptions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
               </Select>
             </Field>
+            <Field label="Category">
+              <Select value={form.category} onChange={e => set("category", e.target.value)} disabled={readOnly}>
+                {CATEGORIES.filter(c => c.id !== "all").map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
+              </Select>
+            </Field>
+            <Field label="Season">
+              <Select value={form.season} onChange={e => set("season", e.target.value)} disabled={readOnly}>
+                {SEASONS.map(s => <option key={s}>{s}</option>)}
+              </Select>
+            </Field>
+            {isPresentation && (
+              <Field label="Customer" span={2}>
+                <Select value={form.customer || ""} onChange={e => set("customer", e.target.value)} disabled={readOnly}>
+                  <option value="">— Select —</option>
+                  {CUSTOMERS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </Select>
+              </Field>
+            )}
             <Field label="Priority" full>
               <PriorityPills value={form.priority || ""} onChange={v => set("priority", v)} readOnly={readOnly} />
             </Field>
-            <Field label="Category"><Select value={form.category} onChange={e => set("category", e.target.value)} disabled={readOnly}>{CATEGORIES.filter(c => c.id !== "all").map(c => <option key={c.id} value={c.id}>{c.label}</option>)}</Select></Field>
             {!isPresentation && (
               <Field label="Blocked by sales" full>
                 <div className="blocker-toggles">
@@ -1561,10 +1721,6 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
                 <p className="field-hint">Tags appear on the card so the team knows why work is paused.</p>
               </Field>
             )}
-            {isPresentation && (
-              <Field label="Customer"><Select value={form.customer || ""} onChange={e => set("customer", e.target.value)} disabled={readOnly}><option value="">— Select —</option>{CUSTOMERS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</Select></Field>
-            )}
-            <Field label="Season"><Select value={form.season} onChange={e => set("season", e.target.value)} disabled={readOnly}>{SEASONS.map(s => <option key={s}>{s}</option>)}</Select></Field>
             <Field label="Art team" full>
               <AssigneePicker
                 assignees={form.assignees}
@@ -1651,7 +1807,12 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
   );
 }
 
-const Field    = ({ label, full, children }) => <div className={`field ${full ? "field-full" : ""}`}><div className="field-label">{label}</div>{children}</div>;
+const Field    = ({ label, full, span, children }) => (
+  <div className={`field ${full ? "field-full" : ""} ${span === 2 ? "field-span-2" : ""}`}>
+    <div className="field-label">{label}</div>
+    {children}
+  </div>
+);
 const Input    = (p) => <input    {...p} className="ui-input" />;
 const Textarea = (p) => <textarea {...p} className="ui-input ui-textarea" />;
 const Select   = (p) => <select   {...p} className="ui-input ui-select" />;
@@ -2140,7 +2301,7 @@ function LicensingPage({
           <h1 className="page-title">Licensing Requests</h1>
           <p className="page-sub">{openCount} open · {doneCount} done</p>
         </div>
-        <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+        <div className="ss-topbar-actions">
           <input value={search} onChange={e => setSearch(e.target.value)}
             placeholder="Search SKUs, requests, project…" className="ss-search" />
           {canCreate && <button onClick={() => setDrawer({ isNew: true })} className="btn-new">+ New Request</button>}
@@ -2223,21 +2384,585 @@ function LicensingPage({
   );
 }
 
+// ─── SALES REQUESTS (matches Licensing UX) ───────────────────────────────────
+function SalesRequestDrawer({
+  req,
+  isNew,
+  onSave,
+  onClose,
+  onDelete,
+  onReview,
+  readOnly = false,
+  canCreate = false,
+  canResolve = false,
+  projects = [],
+  workload = null,
+}) {
+  const [form, setForm] = useState(() => ({
+    id: "",
+    createdAt: "",
+    updatedAt: "",
+    createdBy: "",
+    status: "pending",
+    title: "",
+    message: "",
+    category: "apparel",
+    season: "SS26",
+    projectId: "",
+    reviewNote: "",
+    activity: [],
+    ...(req || {}),
+  }));
+  const s = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [approveBoard, setApproveBoard] = useState(() => {
+    const linked = req?.projectId ? projects.find(p => p.id === req.projectId) : null;
+    if (linked) return linked.projectType === "presentation" ? "presentation" : "product";
+    if (req?.createdBoardType) return req.createdBoardType;
+    return "product";
+  });
+  const st = salesReqStatusOf(form.status);
+  const linkedProject = form.projectId ? projects.find(p => p.id === form.projectId) : null;
+  const createdProject = form.createdProjectId ? projects.find(p => p.id === form.createdProjectId) : null;
+  const activity = form.activity || req?.activity || [];
+  const isPending = (form.status || "pending") === "pending";
+  const isApproved = (form.status || "pending") === "approved";
+  const canEditRequest = !readOnly && canCreate && (isNew || isPending);
+  const canEditReview = !readOnly && canResolve;
+
+  const handleApprove = () => {
+    onReview(form.id, "approved", form.reviewNote, approveBoard);
+  };
+
+  const requestClose = useCallback(() => {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(() => onClose?.(), 180);
+  }, [closing, onClose]);
+
+  useEffect(() => {
+    const onKeyDown = (e) => { if (e.key === "Escape") requestClose(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [requestClose]);
+
+  return (
+    <>
+      <div className={`drawer-overlay ${closing ? "closing" : ""}`} onClick={requestClose} />
+      <div className={`drawer ${closing ? "closing" : ""}`}>
+        <div className="drawer-handle" />
+        <div className="drawer-cat-bar" style={{ background: st.dot }} />
+        <div className="drawer-inner">
+          <div className="drawer-head">
+            <span className="eyebrow">
+              {readOnly ? "View" : isNew ? "New" : "Edit"} Sales Request
+            </span>
+            <button type="button" onClick={requestClose} className="close-btn">✕</button>
+          </div>
+
+          {isNew && canCreate && workload && workload.level !== "calm" && (
+            <div className={`sales-drawer-workload sales-drawer-workload--${workload.level}`}>
+              <strong>{workload.verdict?.title || workload.headline}</strong>
+              <span>{workload.guidance || workload.body}</span>
+              {workload.bullets?.length > 0 && (
+                <ul className="sales-drawer-bullets">
+                  {workload.bullets.slice(0, 2).map((b, i) => <li key={i}>{b}</li>)}
+                </ul>
+              )}
+            </div>
+          )}
+
+          <input
+            value={form.title || ""}
+            readOnly={!canEditRequest}
+            disabled={!canEditRequest}
+            onChange={e => s("title", e.target.value)}
+            placeholder="What should the art team work on?"
+            autoFocus={isNew && canEditRequest}
+            className="drawer-title"
+          />
+
+          <div className="field-grid lic-drawer-sections">
+            <div className="lic-section-head">Sales</div>
+
+            <Field label="Category">
+              <Select value={form.category || "apparel"} disabled={!canEditRequest}
+                onChange={e => s("category", e.target.value)}>
+                {CATEGORIES.filter(c => c.id !== "all").map(c => (
+                  <option key={c.id} value={c.id}>{c.label}</option>
+                ))}
+              </Select>
+            </Field>
+
+            <Field label="Season">
+              <Select value={form.season || "SS26"} disabled={!canEditRequest}
+                onChange={e => s("season", e.target.value)}>
+                {SEASONS.map(ss => <option key={ss} value={ss}>{ss}</option>)}
+              </Select>
+            </Field>
+
+            <Field label="Linked project (optional)" span={2}>
+              <Select value={form.projectId || ""} disabled={!canEditRequest}
+                onChange={e => s("projectId", e.target.value)}>
+                <option value="">None</option>
+                {projects.filter(p => p.stage !== "archived").map(p => (
+                  <option key={p.id} value={p.id}>{p.title}</option>
+                ))}
+              </Select>
+              {linkedProject && <div className="field-hint">Linked to: {linkedProject.title}</div>}
+            </Field>
+
+            <Field label="Request details" full>
+              <Textarea rows={4} value={form.message || ""} disabled={!canEditRequest}
+                onChange={e => s("message", e.target.value)}
+                placeholder="Timeline, customer, SKUs, references…" />
+              {!canEditRequest && <div className="field-hint">From Sales — read only</div>}
+            </Field>
+
+            {(!isNew || canResolve || (form.reviewNote || "").trim()) && (
+              <>
+                <div className="lic-section-head art">Art team</div>
+
+                <Field label="Review note" full>
+                  <Textarea rows={3} value={form.reviewNote || ""} disabled={readOnly || !canEditReview}
+                    onChange={e => s("reviewNote", e.target.value)}
+                    placeholder="Optional note when approving or rejecting" />
+                  {!canEditReview && <div className="field-hint">Art team adds this when reviewing</div>}
+                </Field>
+
+                {canResolve && (isPending || isApproved) && (
+                  <Field label="Add to art board" full>
+                    <p className="field-hint" style={{ marginTop: 0, marginBottom: 10 }}>
+                      {isPending
+                        ? "Approve creates a card on the board you choose."
+                        : "Change which board this request lives on."}
+                    </p>
+                    <div className="seg-toggle seg-toggle--2 sales-board-pick">
+                      <button
+                        type="button"
+                        className={`seg-btn ${approveBoard === "product" ? "active" : ""}`}
+                        onClick={() => setApproveBoard("product")}
+                      >
+                        Products
+                      </button>
+                      <button
+                        type="button"
+                        className={`seg-btn ${approveBoard === "presentation" ? "active pres" : ""}`}
+                        onClick={() => setApproveBoard("presentation")}
+                      >
+                        Presentations
+                      </button>
+                    </div>
+                    {createdProject && (
+                      <div className="sales-board-linked">
+                        On board: <strong>{createdProject.title}</strong>
+                        {form.createdBoardType && (
+                          <span> · {boardTypeLabel(form.createdBoardType)}</span>
+                        )}
+                      </div>
+                    )}
+                  </Field>
+                )}
+
+                <Field label="Status" full>
+                  <div className="lic-status-row">
+                    <span className={`lic-status-pill sales-${form.status || "pending"}`}>
+                      {st.label}
+                    </span>
+                    <span className="mono">
+                      {form.createdBy ? `${form.createdBy} · ` : ""}
+                      {form.createdAt ? formatActivityTime(form.createdAt) : ""}
+                      {form.reviewedBy && form.status !== "pending"
+                        ? ` · ${form.reviewedBy}`
+                        : ""}
+                    </span>
+                  </div>
+                  {!readOnly && canResolve && isPending && (
+                    <div className="drawer-action-pair">
+                      <button type="button" className="btn-primary btn-approve"
+                        onClick={handleApprove}>
+                        Approve & add to board
+                      </button>
+                      <button type="button" className="btn-danger"
+                        onClick={() => onReview(form.id, "rejected", form.reviewNote)}>
+                        Reject
+                      </button>
+                    </div>
+                  )}
+                  {!readOnly && canResolve && isApproved && (
+                    <div className="drawer-action-pair drawer-action-pair--single">
+                      <button type="button" className="btn-primary btn-approve"
+                        onClick={handleApprove}>
+                        {createdProject ? "Update board placement" : "Add to board"}
+                      </button>
+                    </div>
+                  )}
+                </Field>
+              </>
+            )}
+          </div>
+
+          {!isNew && <ActivityLog activity={activity} />}
+
+          {!readOnly ? (
+            <div className="drawer-actions">
+              {canEditRequest && (
+                <button
+                  type="button"
+                  onClick={() => onSave({
+                    ...form,
+                    id: form.id || `sr${Date.now()}`,
+                    status: isPending ? "pending" : form.status,
+                  })}
+                  disabled={!String(form.title || "").trim()}
+                  className="btn-primary"
+                >
+                  {isNew ? "Submit request" : "Save changes"}
+                </button>
+              )}
+              {!isNew && canCreate && (
+                confirmDelete
+                  ? <div style={{ display: "flex", gap: 8, flex: 1 }}>
+                      <button type="button" onClick={() => onDelete(form.id)} className="btn-danger" style={{ flex: 1 }}>Yes, delete</button>
+                      <button type="button" onClick={() => setConfirmDelete(false)} className="btn-cancel">Cancel</button>
+                    </div>
+                  : <button type="button" onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
+              )}
+            </div>
+          ) : (
+            <div className="drawer-actions">
+              <button type="button" onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function SalesWorkloadGate({ workload, onContinue, onCancel }) {
+  const color = workload.color || "#FBBF24";
+  return (
+    <>
+      <div className="drawer-overlay" onClick={onCancel} />
+      <div className="sales-gate-modal" role="dialog" aria-labelledby="sales-gate-title">
+        <h3 id="sales-gate-title" className="sales-gate-title">Before you submit</h3>
+        <span
+          className="sales-gate-pill"
+          style={{ color, borderColor: `${color}44`, background: `${color}14` }}
+        >
+          {workload.verdict?.pill || "Team load"}
+        </span>
+        <p className="sales-gate-verdict">{workload.verdict?.title || workload.headline}</p>
+        <p className="sales-gate-body">{workload.guidance || workload.body}</p>
+        {workload.bullets?.length > 0 && (
+          <ul className="sales-gate-bullets">
+            {workload.bullets.map((b, i) => <li key={i}>{b}</li>)}
+          </ul>
+        )}
+        <p className="sales-gate-ask">Is this urgent and fully scoped — or can it wait / go on an existing project?</p>
+        <div className="sales-gate-actions">
+          <button type="button" className="btn-cancel" onClick={onCancel}>Not now</button>
+          <button type="button" className="btn-primary" onClick={onContinue}>Continue to request</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function SalesRequestsPage({
+  requests,
+  projects,
+  onSave,
+  onDelete,
+  onReview,
+  onOpenProject,
+  canCreate = false,
+  canEdit = false,
+  canResolve = false,
+  hideTopbar = false,
+  search: searchProp = "",
+  onSearchChange,
+  newRequestTick = 0,
+  workload = null,
+  overview = null,
+}) {
+  const [searchLocal, setSearchLocal] = useState("");
+  const search = hideTopbar ? searchProp : searchLocal;
+  const setSearch = hideTopbar ? (onSearchChange || (() => {})) : setSearchLocal;
+  const [drawer, setDrawer] = useState(null);
+  const [gateOpen, setGateOpen] = useState(false);
+
+  const norm = (v) => (v || "").toString().toLowerCase();
+  const q = norm(search).trim();
+  const projTitle = (id) => projects.find(p => p.id === id)?.title || "";
+
+  const pendingCount = (requests || []).filter(r => (r.status || "pending") === "pending").length;
+  const reviewedCount = (requests || []).filter(r => (r.status || "pending") !== "pending").length;
+  const approvedCount = (requests || []).filter(r => r.status === "approved").length;
+  const rejectedCount = (requests || []).filter(r => r.status === "rejected").length;
+
+  const matchesSearch = (r) => {
+    if (!q) return true;
+    return (
+      norm(r.title).includes(q) ||
+      norm(r.message).includes(q) ||
+      norm(r.category).includes(q) ||
+      norm(r.season).includes(q) ||
+      norm(r.createdBy).includes(q) ||
+      norm(projTitle(r.projectId)).includes(q)
+    );
+  };
+
+  const sortReqs = (list) => list.slice().sort((a, b) =>
+    String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")),
+  );
+
+  const byColumn = SALES_REQ_COLUMNS.map(col => ({
+    ...col,
+    items: sortReqs((requests || []).filter(r => (r.status || "pending") === col.id && matchesSearch(r))),
+  }));
+
+  const anyVisible = byColumn.some(c => c.items.length > 0);
+
+  const tryNewRequest = () => {
+    if (canCreate && workload?.gateNewRequest) {
+      setGateOpen(true);
+      return;
+    }
+    setDrawer({ isNew: true });
+  };
+
+  useEffect(() => {
+    if (!newRequestTick || !canCreate) return;
+    if (workload?.gateNewRequest) setGateOpen(true);
+    else setDrawer({ isNew: true });
+  }, [newRequestTick, canCreate, workload?.gateNewRequest]);
+
+  const body = (
+    <>
+      {!hideTopbar && (
+        <div className="ss-topbar">
+          <div>
+            <h1 className="page-title">Sales Requests</h1>
+            <p className="page-sub">{pendingCount} pending · {reviewedCount} reviewed</p>
+          </div>
+          <div className="ss-topbar-actions">
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search requests, project…"
+              className="ss-search"
+            />
+            {canCreate && (
+              <button type="button" onClick={tryNewRequest} className="btn-new">+ New Request</button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {!hideTopbar && (
+        <div className="stats-bar">
+          <div className="stat" style={{ borderColor: "rgba(251,191,36,0.25)" }}>
+            <div><div className="stat-val" style={{ color: C.amber }}>{pendingCount}</div><div className="stat-label">Pending</div></div>
+          </div>
+          <div className="stat" style={{ borderColor: "rgba(52,211,153,0.25)" }}>
+            <div><div className="stat-val" style={{ color: C.green }}>{approvedCount}</div><div className="stat-label">Approved</div></div>
+          </div>
+          <div className="stat" style={{ borderColor: "rgba(248,113,113,0.25)" }}>
+            <div><div className="stat-val" style={{ color: C.red }}>{rejectedCount}</div><div className="stat-label">Rejected</div></div>
+          </div>
+        </div>
+      )}
+
+      {!anyVisible ? (
+        <div className="sales-req-board-panel">
+          <div className="ss-zero" style={{ paddingTop: 48 }}>
+            <div className="ss-zero-icon">◈</div>
+            <div className="ss-zero-title">No requests found</div>
+            <div className="ss-zero-sub">
+              {search.trim()
+                ? "Try a different search."
+                : canCreate
+                  ? "New requests start in Pending review for art to approve."
+                  : "Sales submissions appear in Pending review."}
+            </div>
+            {canCreate && (
+              <button type="button" onClick={tryNewRequest} className="btn-new" style={{ marginTop: 16 }}>+ New Request</button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="sales-req-board-panel">
+          <div className="sales-req-board board scroll-surface">
+            {byColumn.map(col => (
+              <div key={col.id} className="col sales-req-col" data-status={col.id}>
+                <div className="col-head sales-req-col-head">
+                  <span className="col-dot" style={{ background: col.dot }} />
+                  <div className="sales-req-col-titles">
+                    <span className="col-title">{col.label}</span>
+                    <span className="sales-req-col-hint">{col.hint}</span>
+                  </div>
+                  <span className="col-count">{col.items.length}</span>
+                </div>
+                <div className="col-body">
+                  <div className="col-cards col-cards--scroll scroll-surface sales-req-cards">
+                    {col.items.length === 0 ? (
+                      <div className="col-empty">{col.id === "pending" ? "No pending" : "None"}</div>
+                    ) : col.items.map(r => {
+                      const linked = r.projectId ? projects.find(p => p.id === r.projectId) : null;
+                      const onBoard = r.createdProjectId ? projects.find(p => p.id === r.createdProjectId) : null;
+                      const cc = catColor(r.category);
+                      return (
+                        <div
+                          key={r.id}
+                          className="sr-card"
+                          onClick={() => setDrawer({ isNew: false, req: r })}
+                        >
+                          <div className="sr-card-title">{r.title || "Untitled"}</div>
+                          <div className="sr-card-meta">
+                            {r.createdBy || "Team member"} · {formatActivityTime(r.updatedAt || r.createdAt)}
+                          </div>
+                          <div className="sr-card-tags">
+                            <span className="cat-chip sm" style={{ background: `${cc}22`, color: cc, border: `1px solid ${cc}44` }}>
+                              {catLabel(r.category)}
+                            </span>
+                            {r.season && <span className="sr-card-season">{r.season}</span>}
+                          </div>
+                          {onBoard && (
+                            <button
+                              type="button"
+                              className="sr-card-board-link"
+                              onClick={(e) => { e.stopPropagation(); onOpenProject?.(onBoard.id); }}
+                            >
+                              ◈ {onBoard.title} · {boardTypeLabel(r.createdBoardType || (onBoard.projectType === "presentation" ? "presentation" : "product"))}
+                            </button>
+                          )}
+                          {linked && !onBoard && (
+                            <div className="sr-card-linked">Related: {linked.title}</div>
+                          )}
+                          {r.message?.trim() && (
+                            <p className="sr-card-snippet">{r.message.trim().slice(0, 100)}{r.message.length > 100 ? "…" : ""}</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {col.id === "pending" && canCreate && (
+                    <div className="col-add">
+                      <button type="button" className="sales-req-add-btn" onClick={tryNewRequest}>+ Add request</button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {gateOpen && workload && (
+        <SalesWorkloadGate
+          workload={workload}
+          onCancel={() => setGateOpen(false)}
+          onContinue={() => { setGateOpen(false); setDrawer({ isNew: true }); }}
+        />
+      )}
+
+      {drawer && (
+        <SalesRequestDrawer
+          req={drawer.req}
+          isNew={drawer.isNew}
+          workload={drawer.isNew ? workload : null}
+          onSave={(data) => { onSave(data); setDrawer(null); }}
+          onDelete={(id) => { onDelete(id); setDrawer(null); }}
+          onReview={(id, status, note, boardType) => { onReview(id, status, note, boardType); setDrawer(null); }}
+          onOpenProject={onOpenProject}
+          onClose={() => setDrawer(null)}
+          readOnly={!canEdit && !canResolve}
+          canCreate={canCreate}
+          canResolve={canResolve}
+          projects={projects}
+        />
+      )}
+    </>
+  );
+
+  return hideTopbar ? body : <div className="lic-page">{body}</div>;
+}
+
+function SalesPageHost({
+  projects,
+  requests,
+  pendingCount,
+  onSave,
+  onDelete,
+  onReview,
+  onOpenProject,
+  canCreate,
+  canEdit,
+  canResolve,
+  isSalesSubmit,
+}) {
+  const [requestSearch, setRequestSearch] = useState("");
+  const [newRequestTick, setNewRequestTick] = useState(0);
+  const workload = useMemo(
+    () => computeWorkload(computeOverview(projects), pendingCount),
+    [projects, pendingCount],
+  );
+
+  return (
+    <SalesPage
+      projects={projects}
+      pendingCount={pendingCount}
+      requestSearch={requestSearch}
+      onRequestSearchChange={setRequestSearch}
+      onNewRequestClick={() => setNewRequestTick(t => t + 1)}
+      canCreateRequest={canCreate}
+      workloadLevel={workload.level}
+      isSalesSubmit={isSalesSubmit}
+      renderRequests={({ overview, workload: wl }) => (
+        <SalesRequestsPage
+          hideTopbar
+          search={requestSearch}
+          onSearchChange={setRequestSearch}
+          newRequestTick={newRequestTick}
+          overview={overview}
+          workload={wl}
+          requests={requests}
+          projects={projects}
+          onSave={onSave}
+          onDelete={onDelete}
+          onReview={onReview}
+          onOpenProject={onOpenProject}
+          canCreate={canCreate}
+          canEdit={canEdit}
+          canResolve={canResolve}
+        />
+      )}
+    />
+  );
+}
+
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function StudioTracker() {
-  const { canEdit, isViewer, isLicensingTeam, hasLicensingAccess, boardName, user, isLoaded } = useAppRole();
+  const {
+    canEdit, isMaster, isViewer, isLicensingTeam, hasLicensingAccess, boardName, user, isLoaded,
+    canSubmitSalesRequests, canReviewSalesRequests, canViewSalesRequests,
+  } = useAppRole();
   const boardProfile = resolveTeamProfile(boardName) || boardName;
   const { nickname } = useNickname(user?.id);
   const viewerAssigneeName = resolveViewerTeamName(boardName, nickname);
   const actor = activityActor(boardProfile, user);
-  const canEditProjects = canEdit && !isLicensingTeam;
-  const canEditSelectSets = canEdit && !isLicensingTeam;
+  const canEditProjects = isMaster || (canEdit && !isLicensingTeam);
+  const canEditSelectSets = isMaster || (canEdit && !isLicensingTeam);
   const canEditLicensing = canEdit;
-  const canCreateLicensing = canEdit && hasLicensingAccess;
-  const canResolveLicensing = canEdit && !isLicensingTeam;
+  const canCreateLicensing = isMaster || (canEdit && hasLicensingAccess);
+  const canResolveLicensing = isMaster || (canEdit && !isLicensingTeam);
   const [projects,       setProjects]       = useState([]);
   const [sets,           setSets]           = useState([]);
   const [licRequests,    setLicRequests]    = useState([]);
+  const [salesRequests,  setSalesRequests]  = useState([]);
   const licSeenKey = user?.id ? `lic_seen_${user.id}` : null;
   const licSeenAt = (() => {
     if (!licSeenKey) return 0;
@@ -2253,12 +2978,13 @@ export default function StudioTracker() {
   const [page, setPage] = useState(() => {
     try {
       const v = localStorage.getItem(pageKey);
-      if (v === "projects" || v === "selectsets" || v === "licensing") return v;
+      if (v === "analytics") return "sales";
+      if (v === "projects" || v === "selectsets" || v === "licensing" || v === "sales") return v;
     } catch {
       /* ignore */
     }
     return "projects";
-  }); // "projects" | "selectsets" | "licensing"
+  }); // "projects" | "selectsets" | "licensing" | "sales"
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [assigneeFilter, setAssigneeFilter] = useState(null);
   const [boardTagFilter, setBoardTagFilter] = useState(null); // null | "priority" | "awaiting_sales" | "licenses" | "sales_info"
@@ -2369,11 +3095,12 @@ export default function StudioTracker() {
     (async () => {
       try {
         if (window.storage.migrate) await window.storage.migrate();
-        const [p, s, l] = await Promise.all([load(), loadSS(), loadLic()]);
+        const [p, s, l, sr] = await Promise.all([load(), loadSS(), loadLic(), loadSalesReq()]);
         if (!active) return;
         setProjects(p);
         setSets(s);
         setLicRequests(Array.isArray(l) ? l : []);
+        setSalesRequests(Array.isArray(sr) ? sr : []);
       } catch (e) {
         console.error("Failed to load team data:", e);
         if (active) flash("Could not load team board — check Supabase settings");
@@ -2421,12 +3148,17 @@ export default function StudioTracker() {
       window.storage.subscribe?.("lic_v1", (value) => applyRemote(setLicRequests, value)) ??
       (() => {});
 
+    const unsubSalesReq =
+      window.storage.subscribe?.("sales_req_v1", (value) => applyRemote(setSalesRequests, value)) ??
+      (() => {});
+
     const reloadFromCloud = () => {
-      Promise.all([load(), loadSS(), loadLic()]).then(([p, s, l]) => {
+      Promise.all([load(), loadSS(), loadLic(), loadSalesReq()]).then(([p, s, l, sr]) => {
         if (!active) return;
         setProjects(p);
         setSets(s);
         setLicRequests(Array.isArray(l) ? l : []);
+        setSalesRequests(Array.isArray(sr) ? sr : []);
       }).catch(() => {});
     };
 
@@ -2440,6 +3172,7 @@ export default function StudioTracker() {
       unsubProjects();
       unsubSets();
       unsubLic();
+      unsubSalesReq();
       window.removeEventListener("focus", reloadFromCloud);
     };
   }, []);
@@ -2634,6 +3367,7 @@ export default function StudioTracker() {
   const licensesCount = presPool.filter(isWaitingOnLicenses).length;
   const presSalesInfoCount = presPool.filter(isWaitingOnSalesInfo).length;
   const presBlockedCount = presPool.filter(p => isWaitingOnLicenses(p) || isWaitingOnSalesInfo(p)).length;
+  const salesPendingCount = (salesRequests || []).filter(r => (r.status || "pending") === "pending").length;
 
   const handleSSave = (data) => {
     if (!canEditSelectSets) return;
@@ -2678,6 +3412,111 @@ export default function StudioTracker() {
       const next = exists ? prev.map(r => r.id === data.id ? base : r) : [base, ...prev];
       saveLic(next);
       return next;
+    });
+  };
+
+  const handleSalesReqSave = (data) => {
+    const isNew = !salesRequests.some(r => r.id === data.id);
+    if (isNew && !canSubmitSalesRequests) return;
+    if (!isNew && !canSubmitSalesRequests && !canReviewSalesRequests && !canEditProjects) return;
+    const now = new Date().toISOString();
+    setSalesRequests(prev => {
+      const exists = prev.some(r => r.id === data.id);
+      const prevRow = exists ? prev.find(r => r.id === data.id) : null;
+      const base = {
+        ...data,
+        status: data.status === "approved" || data.status === "rejected" ? data.status : "pending",
+        createdAt: data.createdAt || now,
+        updatedAt: now,
+        createdBy: data.createdBy || actor,
+      };
+      const row = withSalesReqActivity(prevRow, base, actor, projects);
+      const next = exists ? prev.map(r => r.id === data.id ? row : r) : [row, ...prev];
+      saveSalesReq(next);
+      return next;
+    });
+    flash(isNew ? "Sales request submitted" : "Request saved");
+  };
+
+  const handleSalesReqReview = (id, status, reviewNote = "", boardType = null) => {
+    if (!canReviewSalesRequests && !canEditProjects) return;
+    const now = new Date().toISOString();
+    const prevRow = salesRequests.find(r => r.id === id);
+    if (!prevRow) return;
+
+    let nextProjects = projects;
+    let createdProjectId = prevRow.createdProjectId;
+    let createdBoardType = prevRow.createdBoardType;
+
+    if (status === "approved" && boardType) {
+      const upsert = upsertProjectForSalesRequest(
+        { ...prevRow, reviewNote: reviewNote ?? prevRow.reviewNote ?? "" },
+        boardType,
+        projects,
+        actor,
+        boardProfile,
+      );
+      nextProjects = upsert.nextProjects;
+      createdProjectId = upsert.projectId;
+      createdBoardType = boardType;
+      const boardLabel = boardTypeLabel(boardType);
+      saveProjects(nextProjects, {
+        message: upsert.created
+          ? `Added “${upsert.title}” to ${boardLabel}`
+          : upsert.moved
+            ? `Moved “${upsert.title}” to ${boardLabel}`
+            : `Linked to ${boardLabel}`,
+        undoSnapshot: projects,
+      });
+      setProjects(nextProjects);
+    }
+
+    const base = {
+      ...prevRow,
+      status,
+      reviewNote: reviewNote ?? prevRow.reviewNote ?? "",
+      reviewedAt: now,
+      reviewedBy: actor,
+      updatedAt: now,
+      createdProjectId: status === "approved" ? createdProjectId : prevRow.createdProjectId,
+      createdBoardType: status === "approved" ? createdBoardType : prevRow.createdBoardType,
+    };
+    const row = withSalesReqActivity(prevRow, base, actor, nextProjects);
+    const nextReqs = salesRequests.map(r => r.id === id ? row : r);
+    setSalesRequests(nextReqs);
+    saveSalesReq(nextReqs);
+
+    if (status === "approved") {
+      flash(createdProjectId && boardType
+        ? `Approved — on ${boardTypeLabel(boardType)} board`
+        : "Request approved");
+    } else {
+      flash("Request rejected");
+    }
+  };
+
+  const handleOpenProjectFromRequest = useCallback((projectId) => {
+    const p = projects.find(x => x.id === projectId);
+    if (!p) {
+      flash("Project not found on board");
+      return;
+    }
+    setPage("projects");
+    setBoardMode(p.projectType === "presentation" ? "presentations" : "products");
+    setDrawer({ project: p, isNew: false });
+  }, [projects]);
+
+  const handleSalesReqDelete = (id) => {
+    if (!canSubmitSalesRequests) return;
+    const removed = salesRequests.find(r => r.id === id);
+    if (!removed) return;
+    const snapshot = salesRequests;
+    const next = salesRequests.filter(r => r.id !== id);
+    setSalesRequests(next);
+    saveSalesReq(next);
+    showUndoToast(`Deleted “${removed.title || "request"}”`, () => {
+      setSalesRequests(snapshot);
+      saveSalesReq(snapshot);
     });
   };
 
@@ -2820,6 +3659,33 @@ export default function StudioTracker() {
         .view-toggle { display: flex; gap: 2px; background: #14141A; border: 1px solid #2A2A36; border-radius: 8px; padding: 3px; }
         .view-btn { padding: 6px 12px; font-size: 12px; font-weight: 600; background: transparent; border: none; border-radius: 6px; color: #56566A; cursor: pointer; font-family: inherit; transition: all 0.15s; }
         .view-btn.active { background: #23232D; color: #F0F0F6; }
+        .seg-toggle {
+          display: grid; width: 100%; gap: 3px; box-sizing: border-box;
+          background: #14141A; border: 1px solid #2A2A36; border-radius: 8px; padding: 3px;
+        }
+        .seg-toggle--2 { grid-template-columns: 1fr 1fr; }
+        .seg-btn {
+          width: 100%; min-width: 0; padding: 8px 10px;
+          font-size: 12px; font-weight: 600; background: transparent; border: none; border-radius: 6px;
+          color: #56566A; cursor: pointer; font-family: inherit; transition: all 0.15s;
+          text-align: center; white-space: nowrap;
+        }
+        .seg-btn:hover:not(:disabled) { color: #9494B0; background: #1C1C24; }
+        .seg-btn.active { background: #23232D; color: #F0F0F6; }
+        .seg-btn.active.pres { background: rgba(139,127,255,0.22); color: #8B7FFF; }
+        .drawer-type-toggle { margin-bottom: 14px; }
+        .drawer-action-pair {
+          display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+          margin-top: 12px; margin-bottom: 4px; width: 100%;
+        }
+        .drawer-action-pair--single { grid-template-columns: 1fr; }
+        .drawer-action-pair .btn-primary,
+        .drawer-action-pair .btn-danger {
+          flex: none; width: 100%; min-height: 38px; padding: 8px 10px; font-size: 12px;
+          white-space: normal; line-height: 1.25;
+        }
+        .drawer-action-pair .btn-approve { background: #34D399; }
+        .drawer-action-pair .btn-approve:hover { opacity: 0.9; }
         .btn-new { padding: 8px 16px; background: #8B7FFF; color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; white-space: nowrap; transition: opacity 0.15s; }
         .btn-new:hover { opacity: 0.88; }
         .btn-new:active { transform: scale(0.97); }
@@ -3171,8 +4037,8 @@ export default function StudioTracker() {
           background: #14141A; border: 1px solid #2A2A36;
           font-size: 13px; line-height: 1.55; color: #9494B0;
         }
-        .drawer-actions-after-notes { margin-top: 16px; margin-bottom: 8px; }
-        .drawer-actions-footer { margin-top: 16px; margin-bottom: 0; }
+        .drawer-actions-after-notes { margin-top: 0; margin-bottom: 8px; padding-top: 0; border-top: none; }
+        .drawer-actions-footer { margin-top: 20px; margin-bottom: 0; padding-top: 0; border-top: none; }
         .drawer-delete-confirm { display: flex; gap: 8px; flex: 1; }
         .notes-rendered { font-size: 13px; line-height: 1.55; color: #9494B0; }
         .text-link { color: #8B7FFF; text-decoration: underline; text-underline-offset: 2px; }
@@ -3261,8 +4127,26 @@ export default function StudioTracker() {
         .eyebrow { font-size: 10px; letter-spacing: 0.12em; color: #56566A; text-transform: uppercase; font-weight: 700; }
         .close-btn { background: none; border: none; font-size: 18px; color: #56566A; cursor: pointer; width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
         .close-btn:hover { background: #1C1C24; color: #F0F0F6; }
-        .drawer-actions { display: flex; flex-direction: column; gap: 10px; }
-        .drawer-actions-row { display: flex; gap: 10px; width: 100%; }
+        .drawer-actions { display: flex; flex-direction: column; gap: 12px; }
+        .drawer-inner > .field-grid + .drawer-actions {
+          margin-top: 28px;
+          padding-top: 18px;
+          border-top: 1px solid #2A2A36;
+        }
+        .drawer-inner > .activity-log + .drawer-actions {
+          margin-top: 22px;
+          padding-top: 0;
+          border-top: none;
+        }
+        .drawer-actions-row {
+          display: grid; grid-template-columns: 1fr auto; gap: 8px; width: 100%; align-items: stretch;
+        }
+        .drawer-actions-row .btn-primary { width: 100%; min-width: 0; }
+        .drawer-actions-row .btn-danger,
+        .drawer-actions-row .btn-cancel { min-width: 0; }
+        .drawer-actions-row .drawer-delete-confirm {
+          display: grid; grid-template-columns: 1fr auto; gap: 8px; min-width: 0;
+        }
         .drawer-move-board {
           width: 100%; padding: 13px 18px;
           background: #1C1C24; border: 1px solid #2A2A36; border-radius: 8px;
@@ -3275,7 +4159,44 @@ export default function StudioTracker() {
         .drawer-title::placeholder { color: #3A3A50; }
         .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
         .field-full { grid-column: 1 / -1; }
+        .field-span-2 { grid-column: span 2; }
         .field-label { font-size: 11px; letter-spacing: 0.05em; color: #56566A; text-transform: uppercase; margin-bottom: 6px; font-weight: 700; }
+        .drawer .field-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 12px; }
+        .drawer .field-grid.field-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .drawer .field-label { font-size: 12px; letter-spacing: 0.02em; color: #787890; margin-bottom: 4px; }
+        .drawer .field-hint { font-size: 12px; margin-top: 6px; line-height: 1.4; }
+        .drawer .ui-input { min-height: 32px; padding: 6px 10px; font-size: 13px; border-radius: 6px; }
+        .drawer .ui-textarea { min-height: 72px; padding: 8px 10px; line-height: 1.5; }
+        .drawer .ui-select { background-position: right 9px center; padding-right: 28px; }
+        .drawer .priority-pills {
+          display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px;
+          padding: 3px; border-radius: 8px; width: 100%; box-sizing: border-box;
+        }
+        .drawer .priority-pill { padding: 6px 8px; min-width: 0; font-size: 12px; flex: none; width: 100%; }
+        .drawer .blocker-toggles { gap: 6px; }
+        .drawer .blocker-toggle { padding: 8px 10px; border-radius: 8px; gap: 8px; }
+        .drawer .blocker-toggle-mark { width: 18px; height: 18px; border-radius: 5px; font-size: 10px; }
+        .drawer .blocker-toggle-title { font-size: 12px; }
+        .drawer .blocker-toggle-desc { font-size: 11px; }
+        .drawer .assignee-pick-btn { padding: 5px 8px; font-size: 12px; border-radius: 6px; }
+        .drawer .assignee-picker { gap: 6px; }
+        .drawer .drawer-inner { padding: 18px 20px 28px; }
+        .drawer .drawer-title { font-size: 18px; margin-bottom: 14px; padding-bottom: 8px; }
+        .drawer .drawer-head { margin-bottom: 12px; }
+        .drawer .btn-primary, .drawer .btn-danger, .drawer .btn-cancel { min-height: 40px; padding-top: 10px; padding-bottom: 10px; }
+        .drawer .lic-drawer-sections { gap: 10px; }
+        .drawer .lic-section-head { font-size: 11px; padding-top: 10px; margin: 2px 0 0; }
+        .drawer .lic-section-head:first-child { padding-top: 0; margin-top: 0; }
+        .drawer .lic-status-row { gap: 8px; }
+        .drawer .lic-status-pill { font-size: 11px; padding: 4px 9px; }
+        .drawer .lic-status-row .mono { font-size: 11px; }
+        .drawer .sales-drawer-workload { margin-bottom: 12px; padding: 8px 10px; gap: 4px; }
+        .drawer .sales-drawer-workload strong { font-size: 12px; }
+        .drawer .sales-drawer-workload span { font-size: 12px; }
+        .drawer .sales-board-linked { font-size: 12px; margin-top: 8px; }
+        .drawer .seg-toggle { padding: 2px; border-radius: 6px; gap: 2px; }
+        .drawer .seg-btn { padding: 7px 8px; font-size: 12px; min-height: 34px; }
+        .drawer .drawer-title:disabled { opacity: 0.9; cursor: default; }
         .ui-input { width: 100%; background: #1C1C24; border: 1px solid #2A2A36; border-radius: 8px; padding: 10px 12px; font-size: 14px; color: #F0F0F6; outline: none; font-family: inherit; box-sizing: border-box; transition: border-color 0.15s; min-height: 42px; }
         .ui-input:focus { border-color: #8B7FFF; }
         .ui-textarea { resize: vertical; line-height: 1.6; min-height: 90px; }
@@ -3284,7 +4205,8 @@ export default function StudioTracker() {
         input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.4); cursor: pointer; }
         .sync-toggle { display: flex; align-items: center; gap: 10px; margin-top: 20px; font-size: 13px; color: #9494B0; cursor: pointer; }
         .sync-toggle input { accent-color: #8B7FFF; width: 16px; height: 16px; }
-        .activity-log { margin-top: 4px; margin-bottom: 20px; padding-top: 16px; border-top: 1px solid #2A2A36; }
+        .activity-log { margin-top: 16px; margin-bottom: 4px; padding-top: 16px; border-top: 1px solid #2A2A36; }
+        .drawer-inner > .activity-log { margin-bottom: 16px; }
         .activity-list { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
         .activity-item { padding: 8px 10px; background: #14141A; border-radius: 8px; border: 1px solid #1E1E28; }
         .activity-text { font-size: 12px; color: #F0F0F6; line-height: 1.4; }
@@ -3405,6 +4327,7 @@ export default function StudioTracker() {
         /* ── SELECT SETS PAGE ── */
         .ss-page { display: flex; flex-direction: column; gap: 20px; }
         .ss-topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+        .ss-topbar-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-left: auto; }
         .ss-search { width: 200px; background: #14141A; border: 1px solid #2A2A36; border-radius: 8px; padding: 8px 12px; font-size: 13px; color: #F0F0F6; outline: none; font-family: inherit; transition: border-color 0.15s; }
         .ss-search:focus { border-color: #8B7FFF; }
 
@@ -3475,6 +4398,9 @@ export default function StudioTracker() {
         }
         .lic-status-pill.open { border-color: rgba(251,191,36,0.25); color: #FBBF24; background: rgba(251,191,36,0.10); }
         .lic-status-pill.done { border-color: rgba(52,211,153,0.25); color: #34D399; background: rgba(52,211,153,0.10); }
+        .lic-status-pill.sales-pending { border-color: rgba(251,191,36,0.25); color: #FBBF24; background: rgba(251,191,36,0.10); }
+        .lic-status-pill.sales-approved { border-color: rgba(52,211,153,0.25); color: #34D399; background: rgba(52,211,153,0.10); }
+        .lic-status-pill.sales-rejected { border-color: rgba(248,113,113,0.25); color: #F87171; background: rgba(248,113,113,0.10); }
         .lic-linked { font-size: 12px; color: #56566A; }
         .lic-linked-title { color: #F0F0F6; font-weight: 600; }
         .lic-msg { font-size: 12px; color: #9494B0; line-height: 1.5; }
@@ -3491,6 +4417,196 @@ export default function StudioTracker() {
         .lic-section-head.art { color: #8B7FFF; }
         .lic-status-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 
+        /* ── SALES ── */
+        .sales-lic-page { gap: 16px; }
+        .sales-split {
+          display: grid;
+          grid-template-columns: 248px minmax(0, 1fr);
+          gap: 16px;
+          align-items: stretch;
+          min-height: min(72vh, calc(100dvh - 200px));
+        }
+        .sales-split-widgets {
+          min-width: 0;
+          display: flex;
+          flex-direction: column;
+        }
+        .sales-split-board {
+          min-width: 0;
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          min-height: 0;
+        }
+        .sa-widgets { display: flex; flex-direction: column; gap: 10px; }
+        .sa-widget {
+          background: #14141A; border: 1px solid #2A2A36; border-radius: 12px;
+          padding: 12px 14px;
+        }
+        .sa-widget-label {
+          font-size: 9px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase;
+          color: #56566A; margin-bottom: 8px;
+        }
+        .sa-verdict--heavy { border-color: rgba(248,113,113,0.28); }
+        .sa-verdict--busy { border-color: rgba(251,191,36,0.22); }
+        .sa-verdict--calm { border-color: rgba(52,211,153,0.2); }
+        .sa-verdict-pill {
+          display: inline-block; font-size: 10px; font-weight: 700; padding: 3px 8px;
+          border-radius: 100px; border: 1px solid; margin-bottom: 8px;
+        }
+        .sa-verdict-title {
+          font-size: 15px; font-weight: 800; color: #F0F0F6; margin: 0 0 6px; line-height: 1.25;
+        }
+        .sa-verdict-hint { font-size: 12px; color: #9494B0; margin: 0 0 10px; line-height: 1.45; }
+        .sa-verdict-bullets {
+          list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px;
+        }
+        .sa-verdict-bullets li {
+          font-size: 11px; color: #9494B0; line-height: 1.4; padding-left: 12px; position: relative;
+        }
+        .sa-verdict-bullets li::before {
+          content: ""; position: absolute; left: 0; top: 6px; width: 4px; height: 4px;
+          border-radius: 50%; background: #56566A;
+        }
+        .sa-queue-grid {
+          display: grid; grid-template-columns: 1fr; gap: 8px;
+        }
+        .sa-queue-cell {
+          padding: 8px 10px; background: #1C1C24; border-radius: 8px; border: 1px solid #23232D;
+        }
+        .sa-queue-val { display: block; font-size: 20px; font-weight: 800; line-height: 1.1; color: #F0F0F6; }
+        .sa-queue-lbl {
+          display: block; font-size: 10px; font-weight: 700; color: #9494B0; margin-top: 2px;
+          text-transform: uppercase; letter-spacing: 0.04em;
+        }
+        .sa-queue-desc { display: block; font-size: 10px; color: #56566A; margin-top: 2px; }
+        .sa-deadline-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .sa-deadline-row {
+          text-align: center; padding: 8px 6px; background: #1C1C24; border-radius: 8px;
+        }
+        .sa-deadline-val { display: block; font-size: 20px; font-weight: 800; color: #F0F0F6; line-height: 1.1; }
+        .sa-deadline-lbl { display: block; font-size: 9px; color: #56566A; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.05em; }
+        .sa-busiest {
+          display: flex; flex-direction: column; gap: 4px; font-size: 11px;
+        }
+        .sa-busiest-lbl { font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; color: #56566A; }
+        .sa-busiest-val { color: #9494B0; font-weight: 600; }
+        .sa-submit-note {
+          font-size: 11px; color: #9494B0; margin: 0; padding: 8px 12px; flex-shrink: 0;
+          background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.18); border-radius: 8px;
+        }
+        .sales-req-board-panel {
+          flex: 1; min-height: 0; display: flex; flex-direction: column;
+          background: #14141A; border: 1px solid #2A2A36; border-radius: 12px;
+          padding: 12px; overflow: hidden;
+        }
+        .sales-req-board {
+          flex: 1; min-height: 0; flex-wrap: nowrap; gap: 10px;
+          padding-bottom: 0; align-items: stretch;
+        }
+        .sales-req-col {
+          flex: 1 1 0; min-width: 0; max-width: none;
+          min-height: 200px;
+        }
+        .sales-req-col-head { cursor: default; padding-bottom: 8px; }
+        .sales-req-col-titles { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+        .sales-req-col-hint { font-size: 10px; font-weight: 500; color: #56566A; text-transform: none; letter-spacing: 0; }
+        .sales-req-cards { max-height: min(58vh, calc(100dvh - 280px)); }
+        .sr-card {
+          background: #1C1C24; border: 1px solid #2A2A36; border-radius: 10px;
+          padding: 10px 11px; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .sr-card:hover { border-color: #3A3A50; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }
+        .sr-card-title { font-size: 13px; font-weight: 700; color: #F0F0F6; line-height: 1.3; margin-bottom: 4px; }
+        .sr-card-meta { font-size: 10px; color: #56566A; margin-bottom: 8px; }
+        .sr-card-tags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; }
+        .sr-card-season { font-size: 10px; color: #56566A; }
+        .sr-card-linked { font-size: 11px; color: #8B7FFF; margin-bottom: 4px; }
+        .sr-card-snippet { font-size: 11px; color: #9494B0; line-height: 1.4; margin: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .sales-req-add-btn {
+          width: 100%; padding: 8px; border-radius: 8px; border: 1px dashed #2A2A36;
+          background: transparent; color: #56566A; font-size: 12px; font-weight: 600;
+          cursor: pointer; font-family: inherit; transition: border-color 0.15s, color 0.15s;
+        }
+        .sales-req-add-btn:hover { border-color: #8B7FFF55; color: #8B7FFF; }
+        .sales-board-pick { margin-bottom: 0; }
+        .sales-board-linked {
+          font-size: 12px; color: #9494B0; margin-top: 10px; padding: 8px 10px;
+          background: rgba(52,211,153,0.08); border: 1px solid rgba(52,211,153,0.22); border-radius: 8px;
+        }
+        .sales-board-linked strong { color: #34D399; }
+        .sr-card-board-link {
+          display: block; width: 100%; text-align: left; margin: 6px 0 4px; padding: 6px 8px;
+          border-radius: 8px; border: 1px solid rgba(52,211,153,0.25); background: rgba(52,211,153,0.08);
+          color: #34D399; font-size: 11px; font-weight: 600; cursor: pointer; font-family: inherit;
+        }
+        .sr-card-board-link:hover { background: rgba(52,211,153,0.14); border-color: rgba(52,211,153,0.4); }
+        .sa-empty { font-size: 13px; color: #56566A; margin: 0; }
+        .btn-new--caution {
+          border-color: rgba(251,191,36,0.45) !important;
+          box-shadow: 0 0 0 1px rgba(251,191,36,0.12);
+        }
+        .sales-gate-modal {
+          position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+          z-index: 10001; width: min(440px, 92vw);
+          background: #1C1C24; border: 1px solid #2A2A36; border-radius: 16px;
+          padding: 24px; box-shadow: 0 24px 60px rgba(0,0,0,0.55);
+        }
+        .sales-gate-title { font-size: 18px; font-weight: 800; color: #F0F0F6; margin: 0 0 12px; }
+        .sales-gate-pill {
+          display: inline-block; font-size: 10px; font-weight: 700; padding: 4px 10px;
+          border-radius: 100px; border: 1px solid; margin-bottom: 10px;
+        }
+        .sales-gate-verdict { font-size: 16px; font-weight: 800; color: #F0F0F6; margin: 0 0 8px; line-height: 1.25; }
+        .sales-gate-body { font-size: 13px; color: #9494B0; line-height: 1.5; margin: 0 0 12px; }
+        .sales-gate-bullets {
+          list-style: none; margin: 0 0 14px; padding: 12px 14px; background: #14141A;
+          border-radius: 10px; border: 1px solid #2A2A36;
+          display: flex; flex-direction: column; gap: 6px;
+        }
+        .sales-gate-bullets li {
+          font-size: 12px; color: #9494B0; line-height: 1.4; padding-left: 12px; position: relative;
+        }
+        .sales-gate-bullets li::before {
+          content: ""; position: absolute; left: 0; top: 7px; width: 4px; height: 4px;
+          border-radius: 50%; background: #8B7FFF;
+        }
+        .sales-gate-ask { font-size: 13px; color: #F0F0F6; margin: 0 0 18px; line-height: 1.45; }
+        .sales-gate-actions { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
+        .sales-drawer-workload {
+          margin-bottom: 16px; padding: 12px 14px; border-radius: 10px; font-size: 12px; line-height: 1.45;
+          display: flex; flex-direction: column; gap: 6px;
+        }
+        .sales-drawer-workload strong { color: #F0F0F6; font-size: 13px; }
+        .sales-drawer-workload span { color: #9494B0; }
+        .sales-drawer-bullets {
+          list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px;
+        }
+        .sales-drawer-bullets li {
+          font-size: 11px; color: #9494B0; padding-left: 10px; position: relative;
+        }
+        .sales-drawer-bullets li::before {
+          content: ""; position: absolute; left: 0; top: 6px; width: 3px; height: 3px;
+          border-radius: 50%; background: #56566A;
+        }
+        .sales-drawer-workload--heavy {
+          background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.28);
+        }
+        .sales-drawer-workload--busy {
+          background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25);
+        }
+        .sales-beta-banner {
+          font-size: 12px; color: #9494B0; line-height: 1.5;
+          padding: 10px 14px; margin-bottom: 12px;
+          background: rgba(139,127,255,0.08); border: 1px solid rgba(139,127,255,0.25);
+          border-radius: 10px;
+        }
+        .sales-beta-banner code { font-size: 11px; color: #8B7FFF; }
+        .sales-pending-pill {
+          display: inline-block; margin-left: 6px;
+          padding: 2px 8px; border-radius: 100px; font-size: 10px; font-weight: 700;
+          background: rgba(251,191,36,0.15); border: 1px solid rgba(251,191,36,0.35); color: #FBBF24;
+        }
         /* ── TOAST ── */
         .toast {
           position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
@@ -3515,6 +4631,11 @@ export default function StudioTracker() {
           .header-right { order: 3; width: 100%; justify-content: flex-end; }
         }
 
+        @media (max-width: 1000px) {
+          .sales-split { grid-template-columns: 1fr; min-height: 0; }
+          .sales-req-board { flex-wrap: wrap; }
+          .sales-req-col { flex: 1 1 100%; min-width: 240px; }
+        }
         @media (max-width: 768px) {
           .header { padding: 0 16px; height: auto; padding-top: 10px; padding-bottom: 10px; }
           .brand-tag { display: none; }
@@ -3526,7 +4647,8 @@ export default function StudioTracker() {
           .filter-bar { gap: 8px; }
           .filter-signal-group { width: 100%; flex-direction: column; align-items: flex-start; gap: 8px; padding: 10px 12px; }
           .signal-chip-row { width: 100%; }
-          .ss-topbar .ss-search { width: 100%; }
+          .ss-topbar-actions { width: 100%; margin-left: 0; }
+          .ss-topbar .ss-search { width: 100%; flex: 1; min-width: 0; }
           .board-tools-row { flex-direction: column; align-items: stretch; }
           .board-tools-focus { margin-left: 0; width: 100%; }
           .team-strip { gap: 5px 6px; padding: 6px 8px; }
@@ -3553,8 +4675,12 @@ export default function StudioTracker() {
           .drawer-inner { padding: 16px 20px max(28px, env(safe-area-inset-bottom)); }
           .drawer-title { font-size: 18px; }
           .field-grid { grid-template-columns: 1fr; gap: 12px; }
+          .drawer .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          .drawer .field-span-2 { grid-column: span 2; }
+          .drawer .field-full { grid-column: 1 / -1; }
           .ui-input { font-size: 16px; }
-          .drawer-actions-row { flex-direction: column; }
+          .drawer-actions-row { grid-template-columns: 1fr; }
+          .drawer-action-pair { grid-template-columns: 1fr; }
           .btn-primary, .btn-danger, .drawer-move-board { width: 100%; }
           .toast { font-size: 12px; max-width: calc(100vw - 32px); white-space: normal; text-align: center; }
         }
@@ -3568,6 +4694,7 @@ export default function StudioTracker() {
           <span className={`sync-pill ${window.storage?.mode === "shared" ? "" : "local"}`}>
             {window.storage?.mode === "shared" ? "Team board" : "This device only"}
           </span>
+          {isMaster && <span className="sync-pill" style={{ borderColor: "rgba(139,127,255,0.35)", color: "#8B7FFF" }}>Master</span>}
           {isViewer && <span className="sync-pill viewer">View only</span>}
           {isLoaded && user?.id && (
             <HeaderNickname userId={user.id} colorName={boardProfile} />
@@ -3580,6 +4707,14 @@ export default function StudioTracker() {
             <button className={`page-nav-btn ${page === "licensing" ? "active" : ""}`} onClick={() => setPage("licensing")}>
               Licensing{licOpenCount > 0 ? <span className="nav-badge">{licOpenCount}</span> : null}
               {hasLicensingAccess && page !== "licensing" && licDoneUpdatedCount > 0 ? <span className="nav-dot" title="New completed updates" /> : null}
+            </button>
+            <button className={`page-nav-btn ${page === "sales" ? "active" : ""}`} onClick={() => setPage("sales")}>
+              Sales
+              {canReviewSalesRequests && salesPendingCount > 0 ? (
+                <span className="nav-badge" title="Pending sales requests">{salesPendingCount}</span>
+              ) : (
+                <span className="nav-badge" style={{ background: "rgba(139,127,255,0.15)", borderColor: "rgba(139,127,255,0.35)", color: "#8B7FFF" }}>Beta</span>
+              )}
             </button>
           </div>
         </div>
@@ -3604,6 +4739,28 @@ export default function StudioTracker() {
       {page === "selectsets" ? (
         <main className="main">
           <SelectSetsPage sets={sets} projects={projects} onSave={handleSSave} onDelete={handleSDelete} canEdit={canEditSelectSets} />
+        </main>
+      ) : page === "sales" ? (
+        <main className="main">
+          {canViewSalesRequests ? (
+            <SalesPageHost
+              projects={projects}
+              requests={salesRequests}
+              pendingCount={salesPendingCount}
+              isSalesSubmit={canSubmitSalesRequests}
+              onSave={(data) => handleSalesReqSave({ ...data, createdBy: data.createdBy || actor })}
+              onDelete={handleSalesReqDelete}
+              onReview={handleSalesReqReview}
+              onOpenProject={handleOpenProjectFromRequest}
+              canCreate={canSubmitSalesRequests}
+              canEdit={canSubmitSalesRequests || canReviewSalesRequests || canEditProjects}
+              canResolve={canReviewSalesRequests || canEditProjects}
+            />
+          ) : (
+            <div className="lic-page">
+              <p className="sa-empty" style={{ paddingTop: 32 }}>You don’t have access to sales requests.</p>
+            </div>
+          )}
         </main>
       ) : page === "licensing" ? (
         <main className="main">
