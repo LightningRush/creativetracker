@@ -42,37 +42,73 @@ export function useNickname(userId) {
   return { nickname, setNickname };
 }
 
+function userEmail(user) {
+  return user?.primaryEmailAddress?.emailAddress?.toLowerCase() || "";
+}
+
+/** Full access — overrides viewer role and Licensing/Sales team limits */
+export function isMasterUser(user) {
+  if (!user) return false;
+  const meta = user.publicMetadata || {};
+  if (meta.master === true || meta.masterAccess === true || meta.isMaster === true) return true;
+  const role = typeof meta.role === "string" ? meta.role.toLowerCase() : "";
+  if (role === "master" || role === "admin" || role === "owner") return true;
+  const ownerEmail = import.meta.env.VITE_OWNER_EMAIL?.toLowerCase();
+  if (ownerEmail && userEmail(user) === ownerEmail) return true;
+  return false;
+}
+
 /** Optional board roster name from Clerk (assignee defaults / activity) */
 export function readBoardTeamName(user) {
   if (!user) return null;
   const meta = user.publicMetadata?.teamName;
   if (typeof meta === "string" && meta.trim()) return meta.trim();
   const ownerEmail = import.meta.env.VITE_OWNER_EMAIL?.toLowerCase();
-  const email = user.primaryEmailAddress?.emailAddress?.toLowerCase();
-  if (ownerEmail && email === ownerEmail) {
+  if (ownerEmail && userEmail(user) === ownerEmail) {
     return import.meta.env.VITE_OWNER_TEAM_NAME || OWNER_TEAM_NAME;
   }
   return null;
 }
 
-/** Clerk publicMetadata.role: "viewer" = read-only */
+/** Clerk publicMetadata.role: "viewer" = read-only (master overrides) */
 export function useAppRole() {
   const { user, isLoaded } = useUser();
+  const isMaster = isMasterUser(user);
   const roleRaw = user?.publicMetadata?.role;
   const role = typeof roleRaw === "string" ? roleRaw.toLowerCase() : "editor";
-  const isViewer = role === "viewer";
-  const canEdit = !isViewer;
+  const isViewer = !isMaster && role === "viewer";
+  const canEdit = isMaster || !isViewer;
   const boardName = user ? readBoardTeamName(user) : null;
   const isLicensingTeam =
-    typeof boardName === "string" && boardName.trim().toLowerCase() === "licensing";
+    !isMaster &&
+    typeof boardName === "string" &&
+    boardName.trim().toLowerCase() === "licensing";
   const licensingAccess = user?.publicMetadata?.licensingAccess;
-  const hasLicensingAccess = isLicensingTeam || licensingAccess === true;
+  const hasLicensingAccess = isMaster || isLicensingTeam || licensingAccess === true;
+  const isSalesTeam =
+    !isMaster &&
+    typeof boardName === "string" &&
+    boardName.trim().toLowerCase() === "sales";
+  const salesAccess = user?.publicMetadata?.salesAccess;
+  const hasSalesAccess = isMaster || isSalesTeam || salesAccess === true;
+  const artReviewAccess = user?.publicMetadata?.artReviewAccess === true;
+  /** Sales team submits; art / creative editors review (master: both) */
+  const canSubmitSalesRequests = isMaster || hasSalesAccess;
+  const canReviewSalesRequests =
+    isMaster || artReviewAccess || (canEdit && !isLicensingTeam && !isSalesTeam);
+  const canViewSalesRequests = isMaster || canReviewSalesRequests || hasSalesAccess;
 
   return {
     canEdit,
+    isMaster,
     isViewer,
     isLicensingTeam,
     hasLicensingAccess,
+    isSalesTeam,
+    hasSalesAccess,
+    canSubmitSalesRequests,
+    canReviewSalesRequests,
+    canViewSalesRequests,
     role,
     isLoaded: isLoaded && !!user,
     boardName,
