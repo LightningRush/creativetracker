@@ -103,7 +103,6 @@ const TEAM = [
   { name: "Candace O.", color: "#F472B6" },
   { name: "Anthony C.", color: "#34D399" },
   { name: "Flavia N.",  color: "#C084FC" },
-  { name: "Angel S.",   color: "#60A5FA" },
   { name: "Rafa C.",    color: "#8B7FFF" },
 ];
 const teamColor = (name) => TEAM.find(t => t.name === name)?.color || "#9494B0";
@@ -727,6 +726,92 @@ const SS_STATUS = [
   { id: "hold",     label: "On Hold",   dot: "#F87171" },
 ];
 const ssStatusOf = (id) => SS_STATUS.find(s => s.id === id) || SS_STATUS[0];
+
+function normalizeFollowUps(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter(f => f && String(f.title || "").trim())
+    .map(f => ({
+      id: f.id || `fu${Date.now()}`,
+      title: String(f.title).trim(),
+      summary: String(f.summary || "").trim(),
+      createdAt: f.createdAt || new Date().toISOString(),
+      createdBy: f.createdBy || "",
+      status: f.status === "tasked" || f.status === "done" ? f.status : "open",
+      productId: f.productId || "",
+    }));
+}
+
+function openFollowUpCount(project) {
+  if (!isPresentationProject(project)) return 0;
+  return normalizeFollowUps(project.followUps).filter(f => f.status === "open").length;
+}
+
+function collectOpenFollowUps(projects) {
+  const items = [];
+  (projects || []).filter(isPresentationProject).forEach(p => {
+    if (p.stage === "archived") return;
+    normalizeFollowUps(p.followUps)
+      .filter(f => f.status === "open")
+      .forEach(f => {
+        items.push({
+          ...f,
+          presentationId: p.id,
+          presentationTitle: p.title,
+          customerName: customerNameOf(p) || "",
+        });
+      });
+  });
+  return items.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+}
+
+function customerNameOf(project) {
+  return CUSTOMERS.find(c => c.id === project?.customer)?.name || "";
+}
+
+function buildProductFromFollowUp(pres, followUp, projects, actor, teamProfile) {
+  const stage = "concept";
+  const inStage = projects.filter(p => p.stage === stage && p.projectType !== "presentation");
+  const maxOrder = inStage.reduce((m, p) => Math.max(m, typeof p.boardOrder === "number" ? p.boardOrder : -1), -1);
+  const assignees = [defaultAssignee(teamProfile)];
+  const now = new Date().toISOString();
+  const cust = customerNameOf(pres);
+  const noteLines = [
+    `Buyer follow-up from presentation: ${pres.title}`,
+    cust ? `Customer: ${cust}` : null,
+    followUp.summary ? followUp.summary : null,
+    followUp.createdBy ? `Logged by ${followUp.createdBy}` : null,
+  ].filter(Boolean);
+
+  const base = {
+    id: `p${Date.now()}`,
+    title: followUp.title,
+    stage,
+    projectType: "product",
+    category: pres.category || "apparel",
+    season: pres.season || "SS26",
+    assignees,
+    dueDate: "",
+    notes: noteLines.join("\n\n"),
+    styleNumbers: [],
+    sourcePresId: pres.id,
+    activity: [],
+    boardOrder: maxOrder + 1,
+    priority: "high",
+    highlightAt: now,
+    assignHighlightAt: now,
+    assignHighlightFor: assignees,
+  };
+  const withCreate = withActivity(null, base, actor);
+  return {
+    ...withCreate,
+    activity: [
+      newActivityEntry(actor, `Created from buyer follow-up on “${pres.title}”`),
+      ...(withCreate.activity || []),
+    ].slice(0, MAX_ACTIVITY),
+  };
+}
+
 async function loadSS() { try { const r = await window.storage.get("ss_v1"); return r ? JSON.parse(r.value) : []; } catch { return []; } }
 async function saveSS(s) { await window.storage.set("ss_v1", JSON.stringify(s)); }
 
@@ -763,7 +848,7 @@ function AssigneeAvatars({ project, size = "sm", maxShow = 3, compact = false })
   );
 }
 
-function AssigneePicker({ assignees, onChange, readOnly }) {
+function AssigneePicker({ assignees, onChange, readOnly, compact = false }) {
   const selected = projectAssignees({ assignees });
   const toggle = (name) => {
     if (readOnly) return;
@@ -775,20 +860,20 @@ function AssigneePicker({ assignees, onChange, readOnly }) {
     }
   };
   return (
-    <div className="assignee-picker">
+    <div className={`assignee-picker ${compact ? "assignee-picker--compact" : ""}`}>
       {TEAM.map(t => {
         const on = selected.includes(t.name);
         return (
-          <button key={t.name} type="button" disabled={readOnly}
-            className={`assignee-pick-btn ${on ? "on" : ""}`}
+          <button key={t.name} type="button" disabled={readOnly} title={t.name}
+            className={`assignee-pick-btn ${on ? "on" : ""} ${compact ? "assignee-pick-btn--avatar" : ""}`}
             style={{ "--tc": t.color }}
             onClick={() => toggle(t.name)}>
-            <span className="av av-xs" style={{ background: t.color }}>{initials(t.name)}</span>
-            {t.name}
+            <span className="av av-sm" style={{ background: t.color }}>{initials(t.name)}</span>
+            {!compact && t.name}
           </button>
         );
       })}
-      {!readOnly && <div className="field-hint">Select everyone working on this project</div>}
+      {!readOnly && !compact && <div className="field-hint">Select everyone working on this project</div>}
     </div>
   );
 }
@@ -983,7 +1068,20 @@ function FocusFilterBar({
   );
 }
 
-function BlockerToggle({ checked, onChange, disabled, tone, title, description }) {
+function BlockerToggle({ checked, onChange, disabled, tone, title, description, compact = false }) {
+  if (compact) {
+    return (
+      <button
+        type="button"
+        className={`assignee-pick-btn blocker-pill ${tone} ${checked ? "on" : ""}`}
+        onClick={() => !disabled && onChange(!checked)}
+        disabled={disabled}
+        aria-pressed={checked}
+      >
+        {title}
+      </button>
+    );
+  }
   return (
     <button
       type="button"
@@ -1022,26 +1120,27 @@ function PriorityPills({ value, onChange, readOnly }) {
 }
 
 // ─── PROJECT FLAGS (priority + sales blockers) ───────────────────────────────
-function ProjectFlags({ project, compact = false }) {
+function cardStatusHints(project) {
+  const hints = [];
   const pr = priorityOf(project);
-  const licenses = isWaitingOnLicenses(project);
-  const salesInfo = isWaitingOnSalesInfo(project);
-  const salesProduct = isWaitingOnSalesProduct(project);
-  if (!pr.id && !licenses && !salesInfo && !salesProduct) return null;
+  if (pr.id === "urgent") hints.push({ key: "priority", label: "Urgent", tone: "urgent", flagClass: "flag-priority-urgent" });
+  else if (pr.id === "high") hints.push({ key: "priority", label: "High", tone: "high", flagClass: "flag-priority-high" });
+  if (isWaitingOnLicenses(project)) hints.push({ key: "licenses", label: "Licenses", tone: "licenses", flagClass: "flag-licenses" });
+  if (isWaitingOnSalesInfo(project)) hints.push({ key: "sales-info", label: "Sales info", tone: "sales", flagClass: "flag-sales-info" });
+  if (isWaitingOnSalesProduct(project)) hints.push({ key: "sales", label: "Awaiting sales", tone: "sales", flagClass: "flag-sales" });
+  const fu = openFollowUpCount(project);
+  if (fu > 0) hints.push({ key: "followup", label: `${fu} follow-up${fu !== 1 ? "s" : ""}`, tone: "followup", flagClass: "flag-followup" });
+  return hints;
+}
+
+function ProjectFlags({ project, compact = false }) {
+  const hints = cardStatusHints(project);
+  if (!hints.length) return null;
   return (
     <div className={`card-flags ${compact ? "compact" : ""}`}>
-      {pr.id && (
-        <span className={`card-flag flag-priority flag-priority-${pr.id}`}>{pr.label}</span>
-      )}
-      {licenses && (
-        <span className="card-flag flag-licenses">Needs licenses</span>
-      )}
-      {salesInfo && (
-        <span className="card-flag flag-sales-info">Awaiting sales info</span>
-      )}
-      {salesProduct && (
-        <span className="card-flag flag-sales">Awaiting sales</span>
-      )}
+      {hints.map(h => (
+        <span key={h.key} className={`card-flag ${h.flagClass}`}>{h.label}</span>
+      ))}
     </div>
   );
 }
@@ -1056,6 +1155,7 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, o
   const pr       = priorityOf(project);
   const licenses = isWaitingOnLicenses(project);
   const salesHold = isWaitingOnSalesInfo(project) || isWaitingOnSalesProduct(project);
+  const statusHints = cardStatusHints(project);
 
   return (
     <div
@@ -1092,18 +1192,18 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, o
       )}
       <div className="card-stripe" />
       <div className="card-body">
-        <ProjectFlags project={project} />
         <div className="card-title">{project.title}</div>
-        <div className="card-tags">
-          <span className="cat-chip" style={{ background: `${cc}22`, color: cc, border: `1px solid ${cc}44` }}>
-            {catLabel(project.category)}
-          </span>
-          <span className="card-season">{project.season}</span>
-        </div>
-        <StyleSkuCardLinks numbers={project.styleNumbers} />
+        <div className="card-meta">{catLabel(project.category)} · {project.season}</div>
+        {statusHints.length > 0 && (
+          <div className="card-status-flags">
+            {statusHints.map(h => (
+              <span key={h.key} className={`card-meta-flag tone-${h.tone}`}>{h.label}</span>
+            ))}
+          </div>
+        )}
         <div className="card-footer">
           <div className="card-assignee">
-            <AssigneeAvatars project={project} />
+            <AssigneeAvatars project={project} size="sm" maxShow={2} />
           </div>
           <div className="card-right">
             {project.dueDate && (
@@ -1545,7 +1645,7 @@ function CalendarView({ projects, onOpen }) {
                         onClick={() => onOpen(p)}
                         title={`${p.title} · ${projectAssignees(p).join(", ")}${dur ? ` · ${dur} days` : ""}`}
                       >
-                        <AssigneeAvatars project={p} size="xs" maxShow={2} compact />
+                        <AssigneeAvatars project={p} size="sm" maxShow={2} />
                         <span className="bar-title">{p.title}</span>
                         {capR && dur && <span className="bar-dur">{dur}d</span>}
                       </div>
@@ -1574,11 +1674,11 @@ function CalendarView({ projects, onOpen }) {
   );
 }
 
-function ActivityLog({ activity }) {
+function ActivityLog({ activity, hideLabel = false }) {
   const items = activity || [];
   return (
     <div className="activity-log">
-      <div className="field-label">Activity</div>
+      {!hideLabel && <div className="field-label">Activity</div>}
       {items.length === 0 ? (
         <div className="activity-empty">No activity yet — moves, edits, and SKUs will show here.</div>
       ) : (
@@ -1595,15 +1695,189 @@ function ActivityLog({ activity }) {
   );
 }
 
+// ─── BUYER FOLLOW-UPS (post-meeting handoff) ───────────────────────────────
+function BuyerFollowUpSection({
+  followUps,
+  onChange,
+  canAdd,
+  canTask,
+  onCreateProduct,
+  projects,
+}) {
+  const items = normalizeFollowUps(followUps);
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftSummary, setDraftSummary] = useState("");
+
+  const add = () => {
+    const title = draftTitle.trim();
+    if (!title || !canAdd) return;
+    const entry = {
+      id: `fu${Date.now()}`,
+      title,
+      summary: draftSummary.trim(),
+      createdAt: new Date().toISOString(),
+      status: "open",
+      productId: "",
+    };
+    onChange([...items, entry]);
+    setDraftTitle("");
+    setDraftSummary("");
+  };
+
+  const markDone = (id) => {
+    onChange(items.map(f => f.id === id ? { ...f, status: "done" } : f));
+  };
+
+  if (!items.length && !canAdd) return null;
+
+  return (
+    <div className="fu-section">
+      <div className="field-label">Buyer follow-ups</div>
+      {canTask && items.some(f => f.status === "open") && (
+        <p className="field-hint fu-hint">Use <strong>Create product</strong> to add work to the board.</p>
+      )}
+      {items.length > 0 && (
+        <ul className="fu-list">
+          {items.map(f => {
+            const linked = f.productId ? projects.find(p => p.id === f.productId) : null;
+            return (
+              <li key={f.id} className={`fu-item fu-item--${f.status}`}>
+                <div className="fu-item-head">
+                  <span className="fu-item-title">{f.title}</span>
+                  <span className={`fu-status-pill ${f.status}`}>
+                    {f.status === "open" ? "Needs tasking" : f.status === "tasked" ? "On board" : "Done"}
+                  </span>
+                </div>
+                {f.summary && <p className="fu-item-summary">{f.summary}</p>}
+                <div className="fu-item-meta">
+                  {f.createdBy && <span>{f.createdBy}</span>}
+                  {f.createdAt && <span>{formatActivityTime(f.createdAt)}</span>}
+                </div>
+                {f.status === "open" && canTask && onCreateProduct && (
+                  <button type="button" className="fu-task-btn" onClick={() => onCreateProduct(f.id)}>
+                    Create product on board
+                  </button>
+                )}
+                {f.status === "tasked" && linked && (
+                  <div className="fu-linked">On board: <strong>{linked.title}</strong></div>
+                )}
+                {canTask && f.status !== "done" && (
+                  <button type="button" className="fu-done-btn" onClick={() => markDone(f.id)}>Mark done</button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {canAdd && (
+        <div className="fu-add">
+          <Input
+            value={draftTitle}
+            onChange={e => setDraftTitle(e.target.value)}
+            placeholder="What the buyer wants (e.g. More MLBPA for Giant Tiger)"
+            onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
+          />
+          <Textarea
+            rows={2}
+            value={draftSummary}
+            onChange={e => setDraftSummary(e.target.value)}
+            placeholder="Meeting summary, qty, timeline, refs…"
+          />
+          <button type="button" className="btn-add-sku" onClick={add} disabled={!draftTitle.trim()}>
+            + Log follow-up
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LogBuyerFollowUpModal({ presentations, onSave, onClose }) {
+  const activePres = (presentations || [])
+    .filter(p => p.stage !== "archived")
+    .sort((a, b) => a.title.localeCompare(b.title));
+  const [presentationId, setPresentationId] = useState(activePres[0]?.id || "");
+  const [title, setTitle] = useState("");
+  const [summary, setSummary] = useState("");
+
+  const submit = () => {
+    if (!presentationId || !title.trim()) return;
+    onSave({ presentationId, title: title.trim(), summary: summary.trim() });
+  };
+
+  return (
+    <>
+      <div className="drawer-overlay" onClick={onClose} />
+      <div className="sales-gate-modal fu-log-modal" role="dialog" aria-labelledby="fu-log-title">
+        <h3 id="fu-log-title" className="sales-gate-title">Log buyer follow-up</h3>
+        <p className="sales-gate-body" style={{ marginBottom: 14 }}>
+          After a buyer meeting, capture what they asked for. Art will see it on the presentation and can create product cards.
+        </p>
+        <div className="field" style={{ marginBottom: 12 }}>
+          <div className="field-label">Presentation</div>
+          <Select value={presentationId} onChange={e => setPresentationId(e.target.value)}>
+            {activePres.length === 0 && <option value="">No presentations yet</option>}
+            {activePres.map(p => (
+              <option key={p.id} value={p.id}>
+                {p.title}{customerNameOf(p) ? ` · ${customerNameOf(p)}` : ""}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <div className="field" style={{ marginBottom: 12 }}>
+          <div className="field-label">What they want</div>
+          <Input
+            value={title}
+            onChange={e => setTitle(e.target.value)}
+            placeholder="e.g. Expanded MLBPA range — 3 styles"
+            autoFocus
+          />
+        </div>
+        <div className="field" style={{ marginBottom: 16 }}>
+          <div className="field-label">Meeting notes</div>
+          <Textarea
+            rows={3}
+            value={summary}
+            onChange={e => setSummary(e.target.value)}
+            placeholder="Buyer feedback, timeline, which lines they liked…"
+          />
+        </div>
+        <div className="sales-gate-actions">
+          <button type="button" className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button type="button" className="btn-primary" onClick={submit} disabled={!presentationId || !title.trim()}>
+            Log for art team
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function DrawerSection({ title, defaultOpen = false, badge, children }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className={`drawer-section ${open ? "is-open" : ""}`}>
+      <button type="button" className="drawer-section-toggle" onClick={() => setOpen(o => !o)} aria-expanded={open}>
+        <span className="drawer-section-title">{title}</span>
+        {badge != null && badge !== 0 && badge !== "" && (
+          <span className="drawer-section-badge">{badge}</span>
+        )}
+        <span className="drawer-section-chevron" aria-hidden>{open ? "▾" : "▸"}</span>
+      </button>
+      {open && <div className="drawer-section-body">{children}</div>}
+    </div>
+  );
+}
+
 // ─── DRAWER ──────────────────────────────────────────────────────────────────
-function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presentations, readOnly = false, defaultAssigneeName = TEAM[0].name }) {
+function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presentations, readOnly = false, defaultAssigneeName = TEAM[0].name, canLogFollowUps = false, canTaskFollowUps = false, onCreateProductFromFollowUp, allProjects = [] }) {
   const [form, setForm] = useState(() => {
     if (project) return { ...project, assignees: projectAssignees(project) };
     return {
       title: "", category: "apparel", stage: "concept", projectType: "product",
       assignees: [defaultAssigneeName], season: "SS26",
       startDate: "", dueDate: "", notes: "", styleNumbers: [], presentationId: "", sourcePresId: "",
-      priority: "", waitingOnSales: false, waitingOnLicenses: false,
+      priority: "", waitingOnSales: false, waitingOnLicenses: false, followUps: [],
     };
   });
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
@@ -1634,16 +1908,23 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [requestClose]);
 
+  const followUpItems = normalizeFollowUps(form.followUps);
+  const skuCount = normalizeStyleEntries(form.styleNumbers).length;
+  const activityCount = (form.activity || []).length;
+  const showFollowUps = isPresentation && (canLogFollowUps || canTaskFollowUps || followUpItems.length > 0);
+  const showSkus = !isPresentation && (isAwaitingSales || skuCount > 0);
+  const [showExtra, setShowExtra] = useState(isNew);
+
   return (
     <>
       <div className={`drawer-overlay ${closing ? "closing" : ""}`} onClick={requestClose} />
-      <div className={`drawer ${closing ? "closing" : ""}`}>
+      <div className={`drawer drawer--focus ${closing ? "closing" : ""}`}>
         <div className="drawer-handle" />
         <div className="drawer-cat-bar" style={{ background: catColor(form.category) }} />
         <div className="drawer-inner">
-          <div className="drawer-head">
-            <span className="eyebrow">{readOnly ? "View" : isNew ? "New" : "Edit"} {isPresentation ? "Presentation" : "Project"}</span>
-            <button onClick={requestClose} className="close-btn">✕</button>
+          <div className="drawer-head drawer-head--focus">
+            <span className="drawer-focus-eyebrow">{isPresentation ? "Presentation" : "Product"}</span>
+            <button type="button" onClick={requestClose} className="close-btn" aria-label="Close">✕</button>
           </div>
 
           {isNew && !readOnly && (
@@ -1654,153 +1935,203 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
           )}
 
           <input value={form.title} onChange={e => set("title", e.target.value)} readOnly={readOnly}
-            placeholder={isPresentation ? "e.g. Costco FW26 Home Goods Pitch" : "Product name"}
-            autoFocus={isNew && !readOnly} className="drawer-title" />
+            placeholder={isPresentation ? "Presentation name" : "Product name"}
+            autoFocus={isNew && !readOnly} className="drawer-title drawer-title--focus" />
 
-          <div className="field-grid">
+          <div className="drawer-focus-body">
             <Field label="Stage">
-              <Select value={form.stage} onChange={e => setStage(e.target.value)} disabled={readOnly}>
+              <Select value={form.stage} onChange={e => setStage(e.target.value)} disabled={readOnly} className="drawer-stage-select">
                 {stageOptions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
               </Select>
             </Field>
-            <Field label="Category">
-              <Select value={form.category} onChange={e => set("category", e.target.value)} disabled={readOnly}>
-                {CATEGORIES.filter(c => c.id !== "all").map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
-              </Select>
-            </Field>
-            <Field label="Season">
-              <Select value={form.season} onChange={e => set("season", e.target.value)} disabled={readOnly}>
-                {SEASONS.map(s => <option key={s}>{s}</option>)}
-              </Select>
-            </Field>
-            {isPresentation && (
-              <Field label="Customer" span={2}>
-                <Select value={form.customer || ""} onChange={e => set("customer", e.target.value)} disabled={readOnly}>
-                  <option value="">— Select —</option>
-                  {CUSTOMERS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                </Select>
+
+            <div className="drawer-core-grid">
+              <Field label="Start">
+                <Input type="date" value={form.startDate} onChange={e => set("startDate", e.target.value)} disabled={readOnly} />
               </Field>
-            )}
-            <Field label="Priority" full>
-              <PriorityPills value={form.priority || ""} onChange={v => set("priority", v)} readOnly={readOnly} />
-            </Field>
-            {!isPresentation && (
-              <Field label="Blocked by sales" full>
-                <div className="blocker-toggles">
-                  <BlockerToggle
-                    checked={!!form.waitingOnSales}
-                    onChange={v => set("waitingOnSales", v)}
-                    disabled={readOnly}
-                    tone="sales"
-                    title="Awaiting sales"
-                    description="Waiting on info or SKUs from sales — shows on the board in any column."
-                  />
-                </div>
+              <Field label="Due">
+                <Input type="date" value={form.dueDate} onChange={e => set("dueDate", e.target.value)} disabled={readOnly} />
               </Field>
-            )}
-            {isPresentation && (
-              <Field label="Blocked by sales" full>
-                <div className="blocker-toggles">
-                  <BlockerToggle
-                    checked={!!form.waitingOnLicenses}
-                    onChange={v => set("waitingOnLicenses", v)}
-                    disabled={readOnly}
-                    tone="licenses"
-                    title="Needs licenses"
-                    description="Sales must provide licenses before art can start."
-                  />
-                  <BlockerToggle
-                    checked={!!form.waitingOnSales}
-                    onChange={v => set("waitingOnSales", v)}
-                    disabled={readOnly}
-                    tone="sales"
-                    title="Awaiting sales info"
-                    description="Meeting held but brief or details aren’t ready yet."
-                  />
-                </div>
-                <p className="field-hint">Tags appear on the card so the team knows why work is paused.</p>
-              </Field>
-            )}
-            <Field label="Art team" full>
+            </div>
+
+            <Field label="Team">
               <AssigneePicker
                 assignees={form.assignees}
                 onChange={v => set("assignees", v)}
                 readOnly={readOnly}
               />
             </Field>
-            <Field label="Start Date"><Input type="date" value={form.startDate} onChange={e => set("startDate", e.target.value)} disabled={readOnly} /></Field>
-            <Field label="End / Due Date"><Input type="date" value={form.dueDate} onChange={e => set("dueDate", e.target.value)} disabled={readOnly} /></Field>
-            {!isPresentation && presentations && presentations.length > 0 && (
-              <Field label="Source Presentation" full>
-                <Select value={form.sourcePresId || ""} onChange={e => set("sourcePresId", e.target.value)} disabled={readOnly}>
-                  <option value="">None — design-led</option>
-                  {presentations.map(p => <option key={p.id} value={p.id}>{p.title}</option>)}
-                </Select>
-              </Field>
+
+            {!readOnly && (
+              <div className="drawer-flag-row">
+                {!isPresentation && (
+                  <BlockerToggle
+                    checked={!!form.waitingOnSales}
+                    onChange={v => set("waitingOnSales", v)}
+                    disabled={readOnly}
+                    tone="sales"
+                    title="Awaiting sales"
+                    compact
+                  />
+                )}
+                {isPresentation && (
+                  <>
+                    <BlockerToggle
+                      checked={!!form.waitingOnLicenses}
+                      onChange={v => set("waitingOnLicenses", v)}
+                      disabled={readOnly}
+                      tone="licenses"
+                      title="Needs licenses"
+                      compact
+                    />
+                    <BlockerToggle
+                      checked={!!form.waitingOnSales}
+                      onChange={v => set("waitingOnSales", v)}
+                      disabled={readOnly}
+                      tone="sales"
+                      title="Awaiting sales info"
+                      compact
+                    />
+                  </>
+                )}
+              </div>
             )}
-            {!isPresentation && (isAwaitingSales || normalizeStyleEntries(form.styleNumbers).length > 0) && (
+
+            {!readOnly ? (
+              <Field label="Notes">
+                <Textarea rows={2} value={form.notes} onChange={e => set("notes", e.target.value)}
+                  placeholder="What’s happening on this project?" />
+              </Field>
+            ) : form.notes?.trim() ? (
+              <div className="drawer-posted-notes drawer-posted-notes--inline">
+                <div className="field-label">Notes</div>
+                <div className="notes-rendered"><LinkedText text={form.notes} /></div>
+              </div>
+            ) : null}
+
+            {showFollowUps && (
+              <BuyerFollowUpSection
+                followUps={form.followUps}
+                onChange={v => set("followUps", v)}
+                canAdd={canLogFollowUps && !isNew}
+                canTask={canTaskFollowUps && !isNew}
+                onCreateProduct={canTaskFollowUps && onCreateProductFromFollowUp
+                  ? (followUpId) => onCreateProductFromFollowUp(form.id, followUpId)
+                  : null}
+                projects={allProjects}
+              />
+            )}
+
+            {showSkus && isAwaitingSales && (
               <StyleSkuSection
                 value={form.styleNumbers}
                 onChange={v => set("styleNumbers", v)}
-                canEdit={isAwaitingSales && !readOnly}
+                canEdit={!readOnly}
+                label="Style numbers"
+                emptyHint="Add SKU + Centric link"
               />
             )}
-            <Field label="Status Notes" full>
-              <Textarea rows={4} value={form.notes} onChange={e => set("notes", e.target.value)} disabled={readOnly}
-                placeholder="Latest updates, blockers, next steps…" />
-            </Field>
+
+            {!isNew && (
+              <button type="button" className="drawer-extra-toggle" onClick={() => setShowExtra(v => !v)} aria-expanded={showExtra}>
+                {showExtra ? "Hide extra fields" : "Extra fields"}
+                <span className="drawer-extra-hint">{catLabel(form.category)} · {form.season}</span>
+              </button>
+            )}
+
+            {(showExtra || isNew) && (
+              <div className="drawer-extra-panel">
+                <div className="drawer-core-grid">
+                  <Field label="Category">
+                    <Select value={form.category} onChange={e => set("category", e.target.value)} disabled={readOnly}>
+                      {CATEGORIES.filter(c => c.id !== "all").map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
+                    </Select>
+                  </Field>
+                  <Field label="Season">
+                    <Select value={form.season} onChange={e => set("season", e.target.value)} disabled={readOnly}>
+                      {SEASONS.map(s => <option key={s}>{s}</option>)}
+                    </Select>
+                  </Field>
+                </div>
+                <div className="drawer-core-grid">
+                  <Field label="Priority">
+                    <Select value={form.priority || ""} onChange={e => set("priority", e.target.value)} disabled={readOnly}>
+                      {PRIORITIES.map(p => <option key={p.id || "none"} value={p.id}>{p.label}</option>)}
+                    </Select>
+                  </Field>
+                  {isPresentation ? (
+                    <Field label="Customer">
+                      <Select value={form.customer || ""} onChange={e => set("customer", e.target.value)} disabled={readOnly}>
+                        <option value="">— Select —</option>
+                        {CUSTOMERS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      </Select>
+                    </Field>
+                  ) : presentations && presentations.length > 0 ? (
+                    <Field label="Source pres.">
+                      <Select value={form.sourcePresId || ""} onChange={e => set("sourcePresId", e.target.value)} disabled={readOnly}>
+                        <option value="">None</option>
+                        {presentations.map(p => <option key={p.id} value={p.id}>{p.title}</option>)}
+                      </Select>
+                    </Field>
+                  ) : <div />}
+                </div>
+
+                {showSkus && !isAwaitingSales && (
+                  <StyleSkuSection
+                    value={form.styleNumbers}
+                    onChange={v => set("styleNumbers", v)}
+                    canEdit={!readOnly}
+                  />
+                )}
+
+                {!isNew && activityCount > 0 && (
+                  <ActivityLog activity={form.activity} hideLabel />
+                )}
+
+                {!readOnly && !isNew && onMoveBoard && (
+                  <button
+                    type="button"
+                    className="drawer-move-board"
+                    onClick={() => onMoveBoard(normalizeProjectForSave({
+                      ...form,
+                      id: form.id,
+                      styleNumbers: normalizeStyleEntries(form.styleNumbers),
+                    }), isPresentation ? "product" : "presentation")}
+                  >
+                    {isPresentation ? "Move to Products board" : "Move to Presentations board"}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
-          {!readOnly ? (
-            <div className="drawer-actions drawer-actions-after-notes">
-              <div className="drawer-actions-row">
-                <button onClick={() => onSave(normalizeProjectForSave({
+          <div className="drawer-footer drawer-footer--sticky">
+            {!readOnly ? (
+              <div className="drawer-footer-actions">
+                <button type="button" onClick={() => onSave(normalizeProjectForSave({
                   ...form,
                   id: form.id || `p${Date.now()}`,
                   styleNumbers: normalizeStyleEntries(form.styleNumbers),
                 }))} disabled={!form.title.trim()} className="btn-primary">
-                  {isNew ? "Create project" : "Save changes"}
+                  {isNew ? "Create" : "Save"}
                 </button>
                 {!isNew && (
-                  confirmDelete
-                    ? <div className="drawer-delete-confirm">
-                        <button onClick={() => onDelete(form.id)} className="btn-danger" style={{ flex: 1 }}>Yes, delete</button>
-                        <button onClick={() => setConfirmDelete(false)} className="btn-cancel">Cancel</button>
+                  <div className="drawer-footer-delete-row">
+                    {confirmDelete ? (
+                      <div className="drawer-delete-confirm drawer-delete-confirm--compact">
+                        <button type="button" onClick={() => onDelete(form.id)} className="btn-danger btn-danger--sm">Delete</button>
+                        <button type="button" onClick={() => setConfirmDelete(false)} className="btn-cancel btn-cancel--sm">Cancel</button>
                       </div>
-                    : <button onClick={() => setConfirmDelete(true)} className="btn-danger">Delete</button>
+                    ) : (
+                      <button type="button" onClick={() => setConfirmDelete(true)} className="btn-ghost-danger btn-ghost-danger--sm">Delete</button>
+                    )}
+                  </div>
                 )}
               </div>
-            </div>
-          ) : (
-            <div className="drawer-actions drawer-actions-after-notes">
-              <button onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
-            </div>
-          )}
-
-          {form.notes?.trim() && (
-            <div className="drawer-posted-notes">
-              <div className="field-label">Posted notes</div>
-              <div className="notes-rendered"><LinkedText text={form.notes} /></div>
-            </div>
-          )}
-
-          {!isNew && <ActivityLog activity={form.activity} />}
-
-          {!readOnly && !isNew && onMoveBoard && (
-            <div className="drawer-actions drawer-actions-footer">
-              <button
-                type="button"
-                className="drawer-move-board"
-                onClick={() => onMoveBoard(normalizeProjectForSave({
-                  ...form,
-                  id: form.id,
-                  styleNumbers: normalizeStyleEntries(form.styleNumbers),
-                }), isPresentation ? "product" : "presentation")}
-              >
-                {isPresentation ? "Move to Products board" : "Move to Presentations board"}
-              </button>
-            </div>
-          )}
+            ) : (
+              <button type="button" onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+            )}
+          </div>
         </div>
       </div>
     </>
@@ -1813,9 +2144,9 @@ const Field    = ({ label, full, span, children }) => (
     {children}
   </div>
 );
-const Input    = (p) => <input    {...p} className="ui-input" />;
-const Textarea = (p) => <textarea {...p} className="ui-input ui-textarea" />;
-const Select   = (p) => <select   {...p} className="ui-input ui-select" />;
+const Input    = (p) => <input    {...p} className={`ui-input ${p.className || ""}`.trim()} />;
+const Textarea = (p) => <textarea {...p} className={`ui-input ui-textarea ${p.className || ""}`.trim()} />;
+const Select   = (p) => <select   {...p} className={`ui-input ui-select ${p.className || ""}`.trim()} />;
 
 // ─── SELECT SET DRAWER ───────────────────────────────────────────────────────
 function SSDrawer({ set, isNew, onSave, onClose, onDelete, readOnly = false }) {
@@ -2903,6 +3234,8 @@ function SalesPageHost({
   canEdit,
   canResolve,
   isSalesSubmit,
+  onLogFollowUpClick,
+  openFollowUps = [],
 }) {
   const [requestSearch, setRequestSearch] = useState("");
   const [newRequestTick, setNewRequestTick] = useState(0);
@@ -2918,6 +3251,8 @@ function SalesPageHost({
       requestSearch={requestSearch}
       onRequestSearchChange={setRequestSearch}
       onNewRequestClick={() => setNewRequestTick(t => t + 1)}
+      onLogFollowUpClick={onLogFollowUpClick}
+      openFollowUps={openFollowUps}
       canCreateRequest={canCreate}
       workloadLevel={workload.level}
       isSalesSubmit={isSalesSubmit}
@@ -2992,6 +3327,7 @@ export default function StudioTracker() {
   const [view,           setView]           = useState("board");
   const [boardMode,      setBoardMode]      = useState("products"); // "products" | "presentations"
   const [drawer,         setDrawer]         = useState(null);
+  const [followUpModalOpen, setFollowUpModalOpen] = useState(false);
   const [projectHighlightSeen, setProjectHighlightSeen] = useState(() => loadProjectHighlightSeen(user?.id));
   const [toast,          setToast]          = useState(null); // { message, onUndo? }
   const toastTimerRef = useRef(null);
@@ -3301,7 +3637,71 @@ export default function StudioTracker() {
     saveProjects(next, { message: `Deleted “${removed.title}”`, undoSnapshot: projects });
   };
 
+  const handleLogBuyerFollowUp = useCallback(({ presentationId, title, summary }) => {
+    if (!canSubmitSalesRequests) return;
+    const pres = projects.find(p => p.id === presentationId && isPresentationProject(p));
+    if (!pres) return;
+    const followUp = {
+      id: `fu${Date.now()}`,
+      title,
+      summary,
+      createdAt: new Date().toISOString(),
+      createdBy: actor,
+      status: "open",
+      productId: "",
+    };
+    const followUps = [...normalizeFollowUps(pres.followUps), followUp];
+    const now = new Date().toISOString();
+    const nextStage = pres.stage === "archived" ? pres.stage : "picks_in";
+    const base = withActivity(pres, {
+      ...pres,
+      followUps,
+      stage: nextStage,
+      highlightAt: now,
+    }, actor);
+    const updated = {
+      ...base,
+      activity: [
+        newActivityEntry(actor, `Buyer follow-up logged: ${title}`),
+        ...(base.activity || []),
+      ].slice(0, MAX_ACTIVITY),
+    };
+    const next = projects.map(p => p.id === pres.id ? updated : p);
+    saveProjects(next, {
+      message: `Logged buyer follow-up on “${pres.title}”`,
+      undoSnapshot: projects,
+    });
+    setFollowUpModalOpen(false);
+  }, [projects, saveProjects, actor, canSubmitSalesRequests]);
+
+  const handleCreateProductFromFollowUp = useCallback((presId, followUpId) => {
+    if (!canEditProjects) return;
+    const pres = projects.find(p => p.id === presId && isPresentationProject(p));
+    if (!pres) return;
+    const followUps = normalizeFollowUps(pres.followUps);
+    const fu = followUps.find(f => f.id === followUpId);
+    if (!fu || fu.status !== "open") return;
+
+    const product = buildProductFromFollowUp(pres, fu, projects, actor, boardProfile);
+    const updatedFollowUps = followUps.map(f =>
+      f.id === followUpId ? { ...f, status: "tasked", productId: product.id } : f,
+    );
+    const updatedPres = withActivity(pres, { ...pres, followUps: updatedFollowUps }, actor);
+    const next = projects.map(p => p.id === pres.id ? updatedPres : p);
+    next.push(product);
+    saveProjects(next, {
+      message: `Created product “${product.title}” from buyer follow-up`,
+      undoSnapshot: projects,
+    });
+    setDrawer(null);
+    setBoardMode("products");
+    setPage("projects");
+    setDrawer({ project: product, isNew: false });
+  }, [projects, saveProjects, actor, canEditProjects, boardProfile]);
+
   const presentationProjects = projects.filter(p => p.projectType === "presentation");
+  const openFollowUps = useMemo(() => collectOpenFollowUps(projects), [projects]);
+  const openFollowUpTotal = openFollowUps.length;
   const licOpenCount = (licRequests || []).filter(r => (r?.status || "open") !== "done").length;
   const licDoneUpdatedCount = (licRequests || []).filter(r => {
     if (!r) return false;
@@ -3603,8 +4003,8 @@ export default function StudioTracker() {
 
         /* ── AVATARS ── */
         .av { border-radius: 50%; color: #fff; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0; }
-        .av-sm { width: 22px; height: 22px; font-size: 9px; }
-        .av-md { width: 28px; height: 28px; font-size: 11px; }
+        .av-sm { width: 24px; height: 24px; font-size: 10px; }
+        .av-md { width: 30px; height: 30px; font-size: 11px; }
         .av-lg { width: 42px; height: 42px; font-size: 15px; box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
 
         /* ── HEADER ── */
@@ -3689,6 +4089,11 @@ export default function StudioTracker() {
         .btn-new { padding: 8px 16px; background: #8B7FFF; color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; white-space: nowrap; transition: opacity 0.15s; }
         .btn-new:hover { opacity: 0.88; }
         .btn-new:active { transform: scale(0.97); }
+        .btn-new--secondary {
+          background: transparent; color: #8B7FFF;
+          border: 1px solid rgba(139,127,255,0.45);
+        }
+        .btn-new--secondary:hover { background: rgba(139,127,255,0.1); opacity: 1; }
 
         /* ── MAIN ── */
         .main { padding: 24px 28px 60px; }
@@ -3945,6 +4350,7 @@ export default function StudioTracker() {
         .flag-sales { background: rgba(251,191,36,0.1); color: #FBBF24; border: 1px dashed rgba(251,191,36,0.45); }
         .flag-sales-info { background: rgba(251,191,36,0.08); color: #FBBF24; border: 1px solid rgba(251,191,36,0.35); }
         .flag-licenses { background: rgba(139,127,255,0.14); color: #8B7FFF; border: 1px solid rgba(139,127,255,0.45); }
+        .flag-followup { background: rgba(52,211,153,0.1); color: #34D399; border: 1px solid rgba(52,211,153,0.35); }
         .card-waiting-licenses:not(.card-priority-urgent):not(.card-priority-high) {
           background: linear-gradient(135deg, #1C1C24 0%, rgba(139,127,255,0.08) 100%);
           border-color: rgba(139,127,255,0.4) !important;
@@ -4009,9 +4415,20 @@ export default function StudioTracker() {
         .card-delete-no { background: #1C1C24; color: #9494B0; }
         .card-delete-no:hover { color: #F0F0F6; }
         .card-confirm-delete { border-color: rgba(248,113,113,0.45) !important; }
-        .card-body { padding: 11px 28px 11px 12px; flex: 1; min-width: 0; }
-        .card-view-only .card-body { padding-right: 12px; }
-        .card-title { font-size: 13px; font-weight: 600; color: #F0F0F6; line-height: 1.4; margin-bottom: 7px; }
+        .card-body { padding: 10px 28px 10px 11px; flex: 1; min-width: 0; }
+        .card-view-only .card-body { padding-right: 11px; }
+        .card-title { font-size: 13px; font-weight: 600; color: #F0F0F6; line-height: 1.35; margin-bottom: 5px; }
+        .card-meta { font-size: 11px; color: #56566A; margin-bottom: 4px; }
+        .card-status-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+        .card-meta-flag {
+          flex-shrink: 0; font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 4px;
+          text-transform: uppercase; letter-spacing: 0.03em; line-height: 1.3;
+        }
+        .card-meta-flag.tone-urgent { color: #F87171; background: rgba(248,113,113,0.12); }
+        .card-meta-flag.tone-high { color: #FBBF24; background: rgba(251,191,36,0.12); }
+        .card-meta-flag.tone-sales { color: #FBBF24; background: rgba(251,191,36,0.08); }
+        .card-meta-flag.tone-licenses { color: #8B7FFF; background: rgba(139,127,255,0.12); }
+        .card-meta-flag.tone-followup { color: #34D399; background: rgba(52,211,153,0.1); }
         .card-tags { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
         .card-sku-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
         .sku-chip { font-size: 10px; font-weight: 600; font-family: ui-monospace, monospace; padding: 3px 7px; border-radius: 4px; background: rgba(251,191,36,0.12); color: #FBBF24; border: 1px solid rgba(251,191,36,0.28); line-height: 1.3; }
@@ -4031,6 +4448,7 @@ export default function StudioTracker() {
         .sku-add-row .ui-input { min-width: 0; }
         .sku-empty-hint { font-size: 12px; color: #56566A; margin-bottom: 10px; }
         .drawer-posted-notes { margin-top: 4px; margin-bottom: 20px; }
+        .drawer-posted-notes--inline { margin-top: 0; margin-bottom: 0; }
         .drawer-posted-notes .field-label { margin-bottom: 8px; }
         .drawer-posted-notes .notes-rendered {
           padding: 12px 14px; border-radius: 10px;
@@ -4051,7 +4469,10 @@ export default function StudioTracker() {
         .btn-add-sku:disabled { opacity: 0.4; cursor: default; }
         .style-numbers-empty { font-size: 12px; color: #56566A; }
         .field-hint { font-size: 11px; color: #56566A; margin-top: 8px; }
-        .card-footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+        .card-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+        .card-assignee { min-width: 0; flex: 1; }
+        .card-assignee .assignee-avatars { min-width: 0; max-width: 100%; }
+        .card-assignee .card-name { max-width: 80px; }
         .card-assignee { display: flex; align-items: center; gap: 5px; min-width: 0; }
         .assignee-avatars { display: flex; align-items: center; gap: 6px; min-width: 0; }
         .assignee-avatars.compact { gap: 4px; }
@@ -4178,11 +4599,119 @@ export default function StudioTracker() {
         .drawer .blocker-toggle-mark { width: 18px; height: 18px; border-radius: 5px; font-size: 10px; }
         .drawer .blocker-toggle-title { font-size: 12px; }
         .drawer .blocker-toggle-desc { font-size: 11px; }
-        .drawer .assignee-pick-btn { padding: 5px 8px; font-size: 12px; border-radius: 6px; }
+        .drawer .assignee-pick-btn { padding: 6px 10px; font-size: 12px; border-radius: 8px; }
+        .drawer .assignee-pick-btn .av-sm { width: 26px; height: 26px; font-size: 10px; }
         .drawer .assignee-picker { gap: 6px; }
         .drawer .drawer-inner { padding: 18px 20px 28px; }
         .drawer .drawer-title { font-size: 18px; margin-bottom: 14px; padding-bottom: 8px; }
-        .drawer .drawer-head { margin-bottom: 12px; }
+        .drawer .drawer-head { margin-bottom: 10px; }
+        .drawer-stage-pill {
+          font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 100px;
+          color: var(--sd, #9494B0); background: color-mix(in srgb, var(--sd, #56566A) 14%, #1C1C24);
+          border: 1px solid color-mix(in srgb, var(--sd, #56566A) 35%, #2A2A36);
+        }
+        .drawer-essentials { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+        .drawer-core-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .drawer-core-grid--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .drawer-action-block { margin-bottom: 12px; }
+        .drawer-section { border-top: 1px solid #2A2A36; }
+        .drawer-section-toggle {
+          width: 100%; display: flex; align-items: center; gap: 8px;
+          padding: 11px 0; background: none; border: none; cursor: pointer;
+          font-family: inherit; text-align: left;
+        }
+        .drawer-section-title { font-size: 12px; font-weight: 700; color: #9494B0; flex: 1; }
+        .drawer-section-badge {
+          font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 100px;
+          background: #1C1C24; border: 1px solid #2A2A36; color: #56566A;
+        }
+        .drawer-section-chevron { font-size: 11px; color: #56566A; }
+        .drawer-section-body { padding-bottom: 12px; display: flex; flex-direction: column; gap: 10px; }
+        .drawer-blocker-row { display: flex; flex-wrap: wrap; gap: 8px; }
+        .drawer-footer { margin-top: 16px; padding-top: 14px; border-top: 1px solid #2A2A36; }
+        .btn-ghost-danger {
+          padding: 10px 14px; font-size: 12px; font-weight: 600;
+          background: transparent; color: #F87171; border: 1px solid transparent;
+          border-radius: 8px; cursor: pointer; font-family: inherit;
+        }
+        .btn-ghost-danger:hover { background: rgba(248,113,113,0.08); border-color: rgba(248,113,113,0.2); }
+        .drawer .assignee-picker .field-hint { display: none; }
+        .drawer .activity-log { margin-top: 0; margin-bottom: 0; padding-top: 0; border-top: none; }
+        .drawer .fu-section { border-top: none; padding-top: 0; margin-top: 0; }
+        .drawer .drawer-move-board { min-height: 38px; padding: 10px 14px; font-size: 12px; }
+        .drawer--simple .drawer-inner { padding-bottom: 80px; }
+        .drawer--focus .drawer-inner { padding: 16px 18px 88px; }
+        .drawer-head--focus { margin-bottom: 4px; }
+        .drawer-focus-eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #56566A; }
+        .drawer-title--focus { font-size: 22px; margin-bottom: 16px; padding-bottom: 0; border-bottom: none; }
+        .drawer-focus-body { display: flex; flex-direction: column; gap: 12px; }
+        .drawer--focus .field-label { text-transform: none; letter-spacing: 0; font-size: 12px; color: #787890; font-weight: 600; }
+        .drawer-stage-select { min-height: 40px; font-size: 14px; font-weight: 600; }
+        .drawer-flag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+        .drawer-flag-row .blocker-pill { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+        .drawer-flag-row .blocker-pill.sales.on {
+          border-color: rgba(251,191,36,0.4); color: #FBBF24;
+          background: rgba(251,191,36,0.1);
+        }
+        .drawer-flag-row .blocker-pill.licenses.on {
+          border-color: rgba(139,127,255,0.4); color: #8B7FFF;
+          background: rgba(139,127,255,0.1);
+        }
+        .drawer-flag-row .blocker-pill:hover:not(:disabled):not(.on) { border-color: #3A3A50; color: #C4C4D4; }
+        .drawer-extra-toggle {
+          width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+          padding: 10px 0; margin-top: 4px; background: none; border: none; border-top: 1px solid #2A2A36;
+          cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600; color: #8B7FFF;
+        }
+        .drawer-extra-hint { font-size: 11px; font-weight: 600; color: #56566A; }
+        .drawer-extra-panel {
+          display: flex; flex-direction: column; gap: 10px;
+          padding: 12px 0 4px; border-top: 1px solid #2A2A36;
+        }
+        .drawer-action-panel { display: flex; flex-direction: column; gap: 8px; }
+        .drawer-action-panel-label { font-size: 11px; font-weight: 700; color: #34D399; text-transform: uppercase; letter-spacing: 0.05em; }
+        .drawer-action-card {
+          display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
+          padding: 10px 12px; border-radius: 8px; background: #1C1C24; border: 1px solid #2A2A36;
+        }
+        .drawer-action-card-title { font-size: 13px; font-weight: 700; color: #F0F0F6; line-height: 1.35; }
+        .drawer-action-card-sub { font-size: 12px; color: #787890; margin-top: 4px; line-height: 1.4; }
+        .drawer-action-card-btn {
+          flex-shrink: 0; padding: 7px 10px; border-radius: 6px; border: none;
+          background: #8B7FFF; color: #fff; font-size: 11px; font-weight: 700;
+          cursor: pointer; font-family: inherit; white-space: nowrap;
+        }
+        .drawer-action-card-btn:hover { background: #9d8fff; }
+        .drawer-head--simple { margin-bottom: 8px; }
+        .drawer-head-meta { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; flex-wrap: wrap; }
+        .drawer-head-dot { color: #3A3A50; font-size: 12px; }
+        .drawer-head-context { font-size: 12px; color: #56566A; font-weight: 600; }
+        .drawer-callout {
+          font-size: 12px; font-weight: 600; padding: 8px 10px; border-radius: 8px;
+          margin-bottom: 10px; line-height: 1.35;
+        }
+        .drawer-callout--followup { color: #34D399; background: rgba(52,211,153,0.08); border: 1px solid rgba(52,211,153,0.2); }
+        .drawer-callout--blocker { color: #FBBF24; background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.2); }
+        .drawer-subgroup { padding-top: 4px; }
+        .drawer-subgroup-label { font-size: 11px; font-weight: 700; color: #56566A; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+        .drawer-footer--sticky {
+          position: sticky; bottom: 0; z-index: 2;
+          background: linear-gradient(to top, #14141A 70%, transparent);
+          margin-top: 8px; padding-top: 12px; padding-bottom: 4px;
+        }
+        .drawer-footer--sticky .drawer-actions-row { grid-template-columns: 1fr; }
+        .drawer-footer-actions { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+        .drawer-footer-delete-row { display: flex; justify-content: flex-end; min-height: 28px; }
+        .drawer-delete-confirm--compact { display: flex; gap: 6px; justify-content: flex-end; }
+        .btn-ghost-danger--sm, .btn-danger--sm, .btn-cancel--sm {
+          min-height: 0; padding: 5px 10px; font-size: 11px; font-weight: 600; border-radius: 6px;
+        }
+        .btn-ghost-danger--sm { padding: 5px 8px; }
+        .drawer-delete-link { width: 100%; text-align: left; margin-top: 4px; }
+        .assignee-picker--compact { gap: 4px; }
+        .assignee-pick-btn--avatar { padding: 4px; border-radius: 100px; min-width: 0; }
+        .assignee-pick-btn--avatar .av { width: 28px; height: 28px; font-size: 10px; }
+        .drawer-section-badge { max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .drawer .btn-primary, .drawer .btn-danger, .drawer .btn-cancel { min-height: 40px; padding-top: 10px; padding-bottom: 10px; }
         .drawer .lic-drawer-sections { gap: 10px; }
         .drawer .lic-section-head { font-size: 11px; padding-top: 10px; margin: 2px 0 0; }
@@ -4491,6 +5020,46 @@ export default function StudioTracker() {
         }
         .sa-busiest-lbl { font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; color: #56566A; }
         .sa-busiest-val { color: #9494B0; font-weight: 600; }
+        .sa-fu-queue { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+        .sa-fu-queue-item { padding: 8px 10px; background: #1C1C24; border-radius: 8px; border: 1px solid #23232D; }
+        .sa-fu-queue-title { display: block; font-size: 12px; font-weight: 600; color: #F0F0F6; line-height: 1.3; }
+        .sa-fu-queue-pres { display: block; font-size: 10px; color: #56566A; margin-top: 3px; }
+        .fu-section { grid-column: 1 / -1; margin-top: 4px; padding-top: 14px; border-top: 1px solid #2A2A36; }
+        .fu-list { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+        .fu-item {
+          padding: 10px 12px; background: #14141A; border: 1px solid #2A2A36; border-radius: 10px;
+        }
+        .fu-item--open { border-color: rgba(251,191,36,0.28); }
+        .fu-item--tasked { border-color: rgba(52,211,153,0.22); }
+        .fu-item-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+        .fu-item-title { font-size: 13px; font-weight: 700; color: #F0F0F6; line-height: 1.3; }
+        .fu-status-pill {
+          font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+          padding: 3px 7px; border-radius: 100px; flex-shrink: 0;
+          background: #1C1C24; border: 1px solid #2A2A36; color: #9494B0;
+        }
+        .fu-status-pill.open { color: #FBBF24; border-color: rgba(251,191,36,0.35); background: rgba(251,191,36,0.1); }
+        .fu-status-pill.tasked { color: #34D399; border-color: rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); }
+        .fu-item-summary { font-size: 12px; color: #9494B0; line-height: 1.45; margin: 0 0 6px; }
+        .fu-item-meta { display: flex; gap: 8px; font-size: 10px; color: #56566A; margin-bottom: 8px; }
+        .fu-task-btn {
+          width: 100%; padding: 8px 12px; border-radius: 8px; border: none;
+          background: #34D399; color: #0C0C10; font-size: 12px; font-weight: 700;
+          cursor: pointer; font-family: inherit; margin-bottom: 6px;
+        }
+        .fu-task-btn:hover { opacity: 0.9; }
+        .fu-done-btn {
+          background: none; border: none; padding: 0; font-size: 11px; font-weight: 600;
+          color: #56566A; cursor: pointer; font-family: inherit;
+        }
+        .fu-done-btn:hover { color: #9494B0; }
+        .fu-linked { font-size: 11px; color: #34D399; margin-bottom: 6px; }
+        .fu-add { display: flex; flex-direction: column; gap: 8px; }
+        .fu-card-chip {
+          font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 100px;
+          background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.35); color: #FBBF24;
+        }
+        .fu-log-modal { max-width: min(480px, 92vw); }
         .sa-submit-note {
           font-size: 11px; color: #9494B0; margin: 0; padding: 8px 12px; flex-shrink: 0;
           background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.18); border-radius: 8px;
@@ -4678,6 +5247,7 @@ export default function StudioTracker() {
           .drawer .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
           .drawer .field-span-2 { grid-column: span 2; }
           .drawer .field-full { grid-column: 1 / -1; }
+          .drawer-core-grid--3 { grid-template-columns: 1fr 1fr; }
           .ui-input { font-size: 16px; }
           .drawer-actions-row { grid-template-columns: 1fr; }
           .drawer-action-pair { grid-template-columns: 1fr; }
@@ -4702,7 +5272,12 @@ export default function StudioTracker() {
         </div>
         <div className="nav-center">
           <div className="page-nav">
-            <button className={`page-nav-btn ${page === "projects" ? "active" : ""}`} onClick={() => setPage("projects")}>Projects</button>
+            <button className={`page-nav-btn ${page === "projects" ? "active" : ""}`} onClick={() => setPage("projects")}>
+              Projects
+              {canEditProjects && openFollowUpTotal > 0 ? (
+                <span className="nav-badge" title="Buyer follow-ups waiting to be tasked">{openFollowUpTotal}</span>
+              ) : null}
+            </button>
             <button className={`page-nav-btn ${page === "selectsets" ? "active" : ""}`} onClick={() => setPage("selectsets")}>Select Sets</button>
             <button className={`page-nav-btn ${page === "licensing" ? "active" : ""}`} onClick={() => setPage("licensing")}>
               Licensing{licOpenCount > 0 ? <span className="nav-badge">{licOpenCount}</span> : null}
@@ -4748,6 +5323,8 @@ export default function StudioTracker() {
               requests={salesRequests}
               pendingCount={salesPendingCount}
               isSalesSubmit={canSubmitSalesRequests}
+              onLogFollowUpClick={canSubmitSalesRequests ? () => setFollowUpModalOpen(true) : undefined}
+              openFollowUps={openFollowUps}
               onSave={(data) => handleSalesReqSave({ ...data, createdBy: data.createdBy || actor })}
               onDelete={handleSalesReqDelete}
               onReview={handleSalesReqReview}
@@ -4895,7 +5472,30 @@ export default function StudioTracker() {
       </main>
       )} {/* end page conditional */}
 
-      {drawer && <Drawer project={drawer.project} isNew={drawer.isNew} onSave={handleSave} onDelete={handleDelete} onMoveBoard={handleMoveBoard} onClose={() => setDrawer(null)} presentations={presentationProjects} readOnly={!canEditProjects} defaultAssigneeName={defaultAssignee(boardProfile)} />}
+      {drawer && (
+        <Drawer
+          project={drawer.project}
+          isNew={drawer.isNew}
+          onSave={handleSave}
+          onDelete={handleDelete}
+          onMoveBoard={handleMoveBoard}
+          onClose={() => setDrawer(null)}
+          presentations={presentationProjects}
+          allProjects={projects}
+          readOnly={!canEditProjects}
+          canLogFollowUps={canSubmitSalesRequests}
+          canTaskFollowUps={canEditProjects}
+          onCreateProductFromFollowUp={handleCreateProductFromFollowUp}
+          defaultAssigneeName={defaultAssignee(boardProfile)}
+        />
+      )}
+      {followUpModalOpen && (
+        <LogBuyerFollowUpModal
+          presentations={presentationProjects}
+          onSave={handleLogBuyerFollowUp}
+          onClose={() => setFollowUpModalOpen(false)}
+        />
+      )}
       {toast && (
         <div className="toast">
           <span className="toast-msg">{toast.message}</span>
