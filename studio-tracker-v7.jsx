@@ -5,11 +5,6 @@ import SalesPage, { computeOverview, computeWorkload } from "./src/SalesPage.jsx
 
 const MAX_ACTIVITY = 50;
 
-const defaultAssignee = (teamProfile) => {
-  const resolved = resolveTeamProfile(teamProfile);
-  return resolved && TEAM.some(t => t.name === resolved) ? resolved : TEAM[0].name;
-};
-
 // ─── PALETTE ─────────────────────────────────────────────────────────────────
 const C = {
   bg:          "#0C0C10",
@@ -143,12 +138,19 @@ const projectAssignees = (p) => {
   return [];
 };
 const projectHasAssignee = (p, name) => projectAssignees(p).includes(name);
+const UNASSIGNED_FILTER = "__unassigned__";
+const isUnassignedProject = (p) => projectAssignees(p).length === 0;
+const projectMatchesAssigneeFilter = (p, filter) => {
+  if (!filter) return true;
+  if (filter === UNASSIGNED_FILTER) return isUnassignedProject(p);
+  return projectHasAssignee(p, filter);
+};
 const assigneesLabel = (names) =>
   names.length <= 2 ? names.join(", ") : `${names[0]} +${names.length - 1}`;
 const normalizeProjectForSave = (p) => {
   const assignees = projectAssignees(p);
   const { assignee: _legacy, ...rest } = p;
-  return { ...rest, assignees: assignees.length ? assignees : [TEAM[0].name] };
+  return { ...rest, assignees };
 };
 
 const PROJ_HIGHLIGHT_SEEN_PREFIX = "st_proj_highlight_seen_";
@@ -549,7 +551,7 @@ function buildProjectFromSalesRequest(req, boardType, projects, actor, teamProfi
   const now = new Date().toISOString();
   const inStage = projects.filter(p => p.stage === stage);
   const maxOrder = inStage.reduce((m, p) => Math.max(m, typeof p.boardOrder === "number" ? p.boardOrder : -1), -1);
-  const assignees = [defaultAssignee(teamProfile)];
+  const assignees = [];
   const noteLines = [];
   if (req.message?.trim()) noteLines.push(`Sales request:\n${req.message.trim()}`);
   if (req.reviewNote?.trim()) noteLines.push(`Art note:\n${req.reviewNote.trim()}`);
@@ -572,8 +574,7 @@ function buildProjectFromSalesRequest(req, boardType, projects, actor, teamProfi
     boardOrder: maxOrder + 1,
     salesRequestId: req.id,
     highlightAt: now,
-    assignHighlightAt: now,
-    assignHighlightFor: assignees,
+    ...(assignees.length ? { assignHighlightAt: now, assignHighlightFor: assignees } : {}),
   };
   const withCreate = withActivity(null, base, actor);
   return {
@@ -773,7 +774,7 @@ function buildProductFromFollowUp(pres, followUp, projects, actor, teamProfile) 
   const stage = "concept";
   const inStage = projects.filter(p => p.stage === stage && p.projectType !== "presentation");
   const maxOrder = inStage.reduce((m, p) => Math.max(m, typeof p.boardOrder === "number" ? p.boardOrder : -1), -1);
-  const assignees = [defaultAssignee(teamProfile)];
+  const assignees = [];
   const now = new Date().toISOString();
   const cust = customerNameOf(pres);
   const noteLines = [
@@ -799,8 +800,7 @@ function buildProductFromFollowUp(pres, followUp, projects, actor, teamProfile) 
     boardOrder: maxOrder + 1,
     priority: "high",
     highlightAt: now,
-    assignHighlightAt: now,
-    assignHighlightFor: assignees,
+    ...(assignees.length ? { assignHighlightAt: now, assignHighlightFor: assignees } : {}),
   };
   const withCreate = withActivity(null, base, actor);
   return {
@@ -828,9 +828,12 @@ async function saveLic(reqs) { await window.storage.set("lic_v1", JSON.stringify
 async function loadSalesReq() { try { const r = await window.storage.get("sales_req_v1"); return r ? JSON.parse(r.value) : []; } catch { return []; } }
 async function saveSalesReq(reqs) { await window.storage.set("sales_req_v1", JSON.stringify(reqs)); }
 
-function AssigneeAvatars({ project, size = "sm", maxShow = 3, compact = false }) {
+function AssigneeAvatars({ project, size = "sm", maxShow = 3, compact = false, showUnassigned = false }) {
   const names = projectAssignees(project);
-  if (!names.length) return null;
+  if (!names.length) {
+    if (!showUnassigned) return null;
+    return <span className="card-unassigned">Unassigned</span>;
+  }
   const shown = names.slice(0, maxShow);
   const extra = names.length - shown.length;
   return (
@@ -853,7 +856,6 @@ function AssigneePicker({ assignees, onChange, readOnly, compact = false }) {
   const toggle = (name) => {
     if (readOnly) return;
     if (selected.includes(name)) {
-      if (selected.length <= 1) return;
       onChange(selected.filter(n => n !== name));
     } else {
       onChange([...selected, name]);
@@ -873,7 +875,11 @@ function AssigneePicker({ assignees, onChange, readOnly, compact = false }) {
           </button>
         );
       })}
-      {!readOnly && !compact && <div className="field-hint">Select everyone working on this project</div>}
+      {!readOnly && !compact && (
+        <div className="field-hint">
+          {selected.length ? "Tap to remove" : "Optional — tap to assign when ready"}
+        </div>
+      )}
     </div>
   );
 }
@@ -1028,7 +1034,7 @@ function FocusFilterBar({
             />
             <SignalFilterChip
               tone="sales"
-              label="Awaiting info"
+              label="Awaiting sales info"
               count={presSalesInfoCount}
               active={boardTagFilter === "sales_info"}
               onClick={() => setBoardTagFilter(f => f === "sales_info" ? null : "sales_info")}
@@ -1126,7 +1132,7 @@ function cardStatusHints(project) {
   if (pr.id === "urgent") hints.push({ key: "priority", label: "Urgent", tone: "urgent", flagClass: "flag-priority-urgent" });
   else if (pr.id === "high") hints.push({ key: "priority", label: "High", tone: "high", flagClass: "flag-priority-high" });
   if (isWaitingOnLicenses(project)) hints.push({ key: "licenses", label: "Licenses", tone: "licenses", flagClass: "flag-licenses" });
-  if (isWaitingOnSalesInfo(project)) hints.push({ key: "sales-info", label: "Sales info", tone: "sales", flagClass: "flag-sales-info" });
+  if (isWaitingOnSalesInfo(project)) hints.push({ key: "sales-info", label: "Awaiting sales info", tone: "sales", flagClass: "flag-sales-info" });
   if (isWaitingOnSalesProduct(project)) hints.push({ key: "sales", label: "Awaiting sales", tone: "sales", flagClass: "flag-sales" });
   const fu = openFollowUpCount(project);
   if (fu > 0) hints.push({ key: "followup", label: `${fu} follow-up${fu !== 1 ? "s" : ""}`, tone: "followup", flagClass: "flag-followup" });
@@ -1203,7 +1209,7 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, o
         )}
         <div className="card-footer">
           <div className="card-assignee">
-            <AssigneeAvatars project={project} size="sm" maxShow={2} />
+            <AssigneeAvatars project={project} size="sm" maxShow={2} showUnassigned />
           </div>
           <div className="card-right">
             {project.dueDate && (
@@ -1544,7 +1550,7 @@ function ListView({ projects, onOpen, shouldGlowProject }) {
                 {stage.label}
               </div>
               <div className="list-assignee">
-                <AssigneeAvatars project={p} maxShow={2} />
+                <AssigneeAvatars project={p} maxShow={2} showUnassigned />
               </div>
               <div className={`list-due ${overdue ? "c-red" : ""}`}>
                 {p.dueDate ? (overdue ? `${Math.abs(days)}d late` : fmt(p.dueDate)) : "—"}
@@ -1870,18 +1876,53 @@ function DrawerSection({ title, defaultOpen = false, badge, children }) {
 }
 
 // ─── DRAWER ──────────────────────────────────────────────────────────────────
-function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presentations, readOnly = false, defaultAssigneeName = TEAM[0].name, canLogFollowUps = false, canTaskFollowUps = false, onCreateProductFromFollowUp, allProjects = [] }) {
+function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presentations, readOnly = false, canLogFollowUps = false, canTaskFollowUps = false, onCreateProductFromFollowUp, allProjects = [] }) {
   const [form, setForm] = useState(() => {
     if (project) return { ...project, assignees: projectAssignees(project) };
     return {
+      id: `p${Date.now()}`,
       title: "", category: "apparel", stage: "concept", projectType: "product",
-      assignees: [defaultAssigneeName], season: "SS26",
+      assignees: [], season: "SS26",
       startDate: "", dueDate: "", notes: "", styleNumbers: [], presentationId: "", sourcePresId: "",
       priority: "", waitingOnSales: false, waitingOnLicenses: false, followUps: [],
     };
   });
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [saveState, setSaveState] = useState("saved");
+  const skipAutoSaveRef = useRef(true);
+  const formRef = useRef(form);
+  formRef.current = form;
+
+  const buildPayload = useCallback(() => normalizeProjectForSave({
+    ...formRef.current,
+    id: formRef.current.id || `p${Date.now()}`,
+    styleNumbers: normalizeStyleEntries(formRef.current.styleNumbers),
+  }), []);
+
+  const flushSave = useCallback(() => {
+    if (readOnly) return;
+    const title = formRef.current.title?.trim();
+    if (!title) return;
+    setSaveState("saving");
+    onSave(buildPayload(), { close: false, silent: true });
+    setSaveState("saved");
+  }, [readOnly, onSave, buildPayload]);
+
+  useEffect(() => {
+    if (readOnly) return;
+    if (skipAutoSaveRef.current) {
+      skipAutoSaveRef.current = false;
+      return;
+    }
+    if (!form.title?.trim()) {
+      setSaveState("idle");
+      return;
+    }
+    setSaveState("pending");
+    const t = setTimeout(flushSave, 600);
+    return () => clearTimeout(t);
+  }, [form, readOnly, flushSave]);
   const isPresentation = form.projectType === "presentation";
   const setStage = (stageId) => {
     setForm(f => ({
@@ -1896,9 +1937,10 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
 
   const requestClose = useCallback(() => {
     if (closing) return;
+    flushSave();
     setClosing(true);
     setTimeout(() => onClose?.(), 180);
-  }, [closing, onClose]);
+  }, [closing, onClose, flushSave]);
 
   useEffect(() => {
     const onKeyDown = (e) => {
@@ -2108,13 +2150,11 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
           <div className="drawer-footer drawer-footer--sticky">
             {!readOnly ? (
               <div className="drawer-footer-actions">
-                <button type="button" onClick={() => onSave(normalizeProjectForSave({
-                  ...form,
-                  id: form.id || `p${Date.now()}`,
-                  styleNumbers: normalizeStyleEntries(form.styleNumbers),
-                }))} disabled={!form.title.trim()} className="btn-primary">
-                  {isNew ? "Create" : "Save"}
-                </button>
+                {form.title.trim() && (
+                  <div className={`drawer-save-status drawer-save-status--${saveState}`} aria-live="polite">
+                    {saveState === "saving" ? "Saving…" : saveState === "pending" ? "Unsaved changes…" : "Saved"}
+                  </div>
+                )}
                 {!isNew && (
                   <div className="drawer-footer-delete-row">
                     {confirmDelete ? (
@@ -3562,9 +3602,7 @@ export default function StudioTracker() {
 
   const handleQuickAdd = useCallback((stageId, title) => {
     if (!canEditProjects) return;
-    const assignees = assigneeFilter
-      ? [assigneeFilter]
-      : [defaultAssignee(boardProfile)];
+    const assignees = assigneeFilter ? [assigneeFilter] : [];
     const now = new Date().toISOString();
     const inStage = projects.filter(p => p.stage === stageId);
     const maxOrder = inStage.reduce((m, p) => Math.max(m, typeof p.boardOrder === "number" ? p.boardOrder : -1), -1);
@@ -3575,15 +3613,15 @@ export default function StudioTracker() {
       assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [],
       boardOrder: maxOrder + 1,
       highlightAt: now,
-      assignHighlightAt: now,
-      assignHighlightFor: assignees,
+      ...(assignees.length ? { assignHighlightAt: now, assignHighlightFor: assignees } : {}),
     };
     const created = withActivity(null, p, actor);
     saveProjects([...projects, created], { message: `Added "${title}"`, undoSnapshot: projects });
   }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, canEditProjects, actor]);
 
-  const handleSave = (data) => {
+  const handleSave = (data, opts = {}) => {
     if (!canEditProjects) return;
+    const { close = true, silent = false } = opts;
     const exists = projects.some(p => p.id === data.id);
     const prev = exists ? projects.find(p => p.id === data.id) : null;
     const prevAs = prev ? projectAssignees(prev) : [];
@@ -3593,8 +3631,7 @@ export default function StudioTracker() {
     const highlightPatch = !exists
       ? {
           highlightAt: now,
-          assignHighlightAt: now,
-          assignHighlightFor: nextAs,
+          ...(nextAs.length ? { assignHighlightAt: now, assignHighlightFor: nextAs } : {}),
         }
       : addedAssignees.length
         ? { assignHighlightAt: now, assignHighlightFor: addedAssignees }
@@ -3605,9 +3642,17 @@ export default function StudioTracker() {
       styleNumbers: normalizeStyleEntries(data.styleNumbers),
     });
     const updated = withActivity(prev, payload, actor);
-    const next = exists ? projects.map(p => p.id === data.id ? updated : p) : [updated, ...projects];
-    saveProjects(next, { undoSnapshot: projects });
-    setDrawer(null);
+    const next = exists ? projects.map(p => p.id === data.id ? updated : p) : [...projects, updated];
+    if (silent) {
+      saveProjects(next);
+    } else {
+      saveProjects(next, { undoSnapshot: projects });
+    }
+    if (close) {
+      setDrawer(null);
+    } else if (!exists) {
+      setDrawer({ project: updated, isNew: false });
+    }
   };
 
   const handleMoveBoard = (data, targetType) => {
@@ -3730,7 +3775,7 @@ export default function StudioTracker() {
   }, [pageKey, page]);
   const catPool = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
-    const asnOk  = !assigneeFilter || projectHasAssignee(p, assigneeFilter);
+    const asnOk  = projectMatchesAssigneeFilter(p, assigneeFilter);
     const q = search.toLowerCase();
     const txtOk  = !search || p.title.toLowerCase().includes(q) || styleNumbersOf(p).some(s => s.toLowerCase().includes(q));
     return typeOk && asnOk && txtOk && p.stage !== "archived";
@@ -3742,7 +3787,7 @@ export default function StudioTracker() {
   const filtered = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const catOk  = categoryFilter === "all" || p.category === categoryFilter;
-    const asnOk  = !assigneeFilter || projectHasAssignee(p, assigneeFilter);
+    const asnOk  = projectMatchesAssigneeFilter(p, assigneeFilter);
     const tagOk  = !boardTagFilter
       || (boardTagFilter === "priority" && hasPriority(p))
       || (boardTagFilter === "awaiting_sales" && isBlockedBySales(p))
@@ -4117,6 +4162,10 @@ export default function StudioTracker() {
         .asn-chip { position: relative; cursor: pointer; transition: transform 0.15s; border-radius: 50%; border: 2px solid transparent; }
         .asn-chip:hover { transform: scale(1.1); }
         .asn-chip.asn-on { border-color: #8B7FFF; box-shadow: 0 0 0 2px #0C0C10, 0 0 0 4px #8B7FFF; }
+        .asn-chip--unassigned { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; background: #1C1C24; border: 2px dashed #3A3A50; }
+        .asn-chip--unassigned.asn-on { border-style: solid; border-color: #8B7FFF; }
+        .asn-unassigned-mark { font-size: 14px; font-weight: 700; color: #56566A; line-height: 1; }
+        .asn-chip--unassigned.asn-on .asn-unassigned-mark { color: #9494B0; }
         .filter-signal-group {
           display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
           background: #14141A; border: 1px solid #1E1E28; border-radius: 10px;
@@ -4473,6 +4522,7 @@ export default function StudioTracker() {
         .card-assignee { min-width: 0; flex: 1; }
         .card-assignee .assignee-avatars { min-width: 0; max-width: 100%; }
         .card-assignee .card-name { max-width: 80px; }
+        .card-unassigned { font-size: 11px; color: #56566A; font-style: italic; }
         .card-assignee { display: flex; align-items: center; gap: 5px; min-width: 0; }
         .assignee-avatars { display: flex; align-items: center; gap: 6px; min-width: 0; }
         .assignee-avatars.compact { gap: 4px; }
@@ -4701,6 +4751,9 @@ export default function StudioTracker() {
         }
         .drawer-footer--sticky .drawer-actions-row { grid-template-columns: 1fr; }
         .drawer-footer-actions { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+        .drawer-save-status { font-size: 12px; font-weight: 600; text-align: center; padding: 8px 0 2px; color: #56566A; }
+        .drawer-save-status--saved { color: #34D399; }
+        .drawer-save-status--saving, .drawer-save-status--pending { color: #9494B0; }
         .drawer-footer-delete-row { display: flex; justify-content: flex-end; min-height: 28px; }
         .drawer-delete-confirm--compact { display: flex; gap: 6px; justify-content: flex-end; }
         .btn-ghost-danger--sm, .btn-danger--sm, .btn-cancel--sm {
@@ -5435,6 +5488,13 @@ export default function StudioTracker() {
                 <span className="av av-md" style={{ background: t.color }}>{initials(t.name)}</span>
               </div>
             ))}
+            <div
+              title="Unassigned"
+              className={`asn-chip asn-chip--unassigned ${assigneeFilter === UNASSIGNED_FILTER ? "asn-on" : ""}`}
+              onClick={() => setAssigneeFilter(f => f === UNASSIGNED_FILTER ? null : UNASSIGNED_FILTER)}
+            >
+              <span className="asn-unassigned-mark" aria-hidden>—</span>
+            </div>
           </div>
         </div>
 
@@ -5486,7 +5546,6 @@ export default function StudioTracker() {
           canLogFollowUps={canSubmitSalesRequests}
           canTaskFollowUps={canEditProjects}
           onCreateProductFromFollowUp={handleCreateProductFromFollowUp}
-          defaultAssigneeName={defaultAssignee(boardProfile)}
         />
       )}
       {followUpModalOpen && (
