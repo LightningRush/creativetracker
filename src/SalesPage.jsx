@@ -192,7 +192,7 @@ export function computeWorkload(overview, pendingRequests = 0) {
   };
 }
 
-function WorkloadWidgets({ overview, workload, pendingRequests }) {
+function WorkloadWidgets({ overview, workload, pendingRequests, openFollowUps = [] }) {
   const { verdict, bullets, level } = workload;
   const color = workload.color;
 
@@ -261,6 +261,25 @@ function WorkloadWidgets({ overview, workload, pendingRequests }) {
           </span>
         </div>
       )}
+
+      {openFollowUps.length > 0 && (
+        <div className="sa-widget sa-fu-widget">
+          <div className="sa-widget-label">Waiting for art to task</div>
+          <ul className="sa-fu-queue">
+            {openFollowUps.slice(0, 5).map(f => (
+              <li key={f.id} className="sa-fu-queue-item">
+                <span className="sa-fu-queue-title">{f.title}</span>
+                <span className="sa-fu-queue-pres">{f.presentationTitle}</span>
+              </li>
+            ))}
+          </ul>
+          {openFollowUps.length > 5 && (
+            <p className="sa-widget-hint" style={{ margin: "8px 0 0" }}>
+              +{openFollowUps.length - 5} more on the presentations board
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -271,6 +290,8 @@ export default function SalesPage({
   requestSearch = "",
   onRequestSearchChange,
   onNewRequestClick,
+  onLogFollowUpClick,
+  openFollowUps = [],
   canCreateRequest = false,
   workloadLevel = "calm",
   renderRequests,
@@ -301,6 +322,11 @@ export default function SalesPage({
             placeholder="Search requests, project…"
             className="ss-search"
           />
+          {canCreateRequest && onLogFollowUpClick && (
+            <button type="button" onClick={onLogFollowUpClick} className="btn-new btn-new--secondary">
+              Log buyer follow-up
+            </button>
+          )}
           {canCreateRequest && (
             <button
               type="button"
@@ -315,7 +341,12 @@ export default function SalesPage({
 
       <div className="sales-split">
         <aside className="sales-split-widgets">
-          <WorkloadWidgets overview={overview} workload={workload} pendingRequests={pendingCount} />
+          <WorkloadWidgets
+            overview={overview}
+            workload={workload}
+            pendingRequests={pendingCount}
+            openFollowUps={openFollowUps}
+          />
         </aside>
 
         <section className="sales-split-board">
