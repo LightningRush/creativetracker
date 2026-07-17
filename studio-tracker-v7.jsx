@@ -29,6 +29,7 @@ const STAGES = [
   { id: "concept",    label: "Concept",    dot: "#6B7280" },
   { id: "design_dev", label: "Design",     dot: "#818CF8" },
   { id: "awaiting_sales", label: "Awaiting Sales", dot: "#FBBF24" },
+  { id: "uploads",    label: "Uploads",    dot: "#22D3EE" },
   { id: "tech_pack",  label: "Tech Pack",  dot: "#60A5FA" },
   { id: "sampling",   label: "Sampling",   dot: "#C084FC" },
   { id: "revision",   label: "Revision",   dot: "#FB923C" },
@@ -221,6 +222,7 @@ const STAGE_CROSS_MAP = {
   tech_pack: "review",
   sampling: "review",
   revision: "review",
+  uploads: "review",
   prod_ready: "picks_in",
   archived: "archived",
   brief: "concept",
@@ -1900,14 +1902,24 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
     styleNumbers: normalizeStyleEntries(formRef.current.styleNumbers),
   }), []);
 
-  const flushSave = useCallback(() => {
-    if (readOnly) return;
+  const flushSave = useCallback((opts = {}) => {
+    if (readOnly) return false;
     const title = formRef.current.title?.trim();
-    if (!title) return;
+    if (!title) return false;
     setSaveState("saving");
-    onSave(buildPayload(), { close: false, silent: true });
-    setSaveState("saved");
+    try {
+      onSave(buildPayload(), { close: false, silent: opts.silent !== false });
+      setSaveState("saved");
+      return true;
+    } catch {
+      setSaveState("pending");
+      return false;
+    }
   }, [readOnly, onSave, buildPayload]);
+
+  const handleManualSave = useCallback(() => {
+    flushSave({ silent: false });
+  }, [flushSave]);
 
   useEffect(() => {
     if (readOnly) return;
@@ -1920,7 +1932,7 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
       return;
     }
     setSaveState("pending");
-    const t = setTimeout(flushSave, 600);
+    const t = setTimeout(() => flushSave({ silent: true }), 800);
     return () => clearTimeout(t);
   }, [form, readOnly, flushSave]);
   const isPresentation = form.projectType === "presentation";
@@ -2150,9 +2162,17 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
           <div className="drawer-footer drawer-footer--sticky">
             {!readOnly ? (
               <div className="drawer-footer-actions">
+                <button
+                  type="button"
+                  onClick={handleManualSave}
+                  disabled={!form.title.trim() || saveState === "saving"}
+                  className="btn-primary"
+                >
+                  {saveState === "saving" ? "Saving…" : isNew && saveState !== "saved" ? "Create" : "Save"}
+                </button>
                 {form.title.trim() && (
                   <div className={`drawer-save-status drawer-save-status--${saveState}`} aria-live="polite">
-                    {saveState === "saving" ? "Saving…" : saveState === "pending" ? "Unsaved changes…" : "Saved"}
+                    {saveState === "saving" ? "Saving…" : saveState === "pending" ? "Unsaved changes — autosaving…" : "Saved"}
                   </div>
                 )}
                 {!isNew && (
@@ -4751,7 +4771,7 @@ export default function StudioTracker() {
         }
         .drawer-footer--sticky .drawer-actions-row { grid-template-columns: 1fr; }
         .drawer-footer-actions { display: flex; flex-direction: column; gap: 6px; width: 100%; }
-        .drawer-save-status { font-size: 12px; font-weight: 600; text-align: center; padding: 8px 0 2px; color: #56566A; }
+        .drawer-save-status { font-size: 11px; font-weight: 600; text-align: center; padding: 2px 0 0; color: #56566A; }
         .drawer-save-status--saved { color: #34D399; }
         .drawer-save-status--saving, .drawer-save-status--pending { color: #9494B0; }
         .drawer-footer-delete-row { display: flex; justify-content: flex-end; min-height: 28px; }
