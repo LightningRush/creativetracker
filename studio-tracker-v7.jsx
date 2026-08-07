@@ -154,6 +154,61 @@ const normalizeProjectForSave = (p) => {
   return { ...rest, assignees };
 };
 
+/** Best-effort "how fresh is this project" for sync merges */
+function projectSyncTime(p) {
+  if (!p) return 0;
+  return Math.max(
+    Date.parse(p.updatedAt || "") || 0,
+    Date.parse(p.activity?.[0]?.at || "") || 0,
+    Date.parse(p.assignHighlightAt || "") || 0,
+    Date.parse(p.highlightAt || "") || 0,
+  );
+}
+
+/**
+ * Merge local + remote boards so a stale cloud snapshot can't wipe
+ * a move/create that already happened on this client.
+ */
+function mergeProjectsBoard(local, remote) {
+  if (!Array.isArray(remote)) return { merged: Array.isArray(local) ? local : [], localWins: false };
+  if (!Array.isArray(local) || !local.length) return { merged: remote, localWins: false };
+
+  const byId = new Map();
+  let localWins = false;
+
+  for (const p of remote) {
+    if (p?.id) byId.set(p.id, p);
+  }
+
+  for (const p of local) {
+    if (!p?.id) continue;
+    const r = byId.get(p.id);
+    if (!r) {
+      byId.set(p.id, p);
+      localWins = true;
+      continue;
+    }
+    if (projectSyncTime(p) > projectSyncTime(r)) {
+      byId.set(p.id, p);
+      localWins = true;
+    }
+  }
+
+  const used = new Set();
+  const merged = [];
+  for (const p of remote) {
+    if (!p?.id || used.has(p.id)) continue;
+    merged.push(byId.get(p.id) || p);
+    used.add(p.id);
+  }
+  for (const p of local) {
+    if (!p?.id || used.has(p.id)) continue;
+    merged.push(byId.get(p.id) || p);
+    used.add(p.id);
+  }
+  return { merged, localWins };
+}
+
 const PROJ_HIGHLIGHT_SEEN_PREFIX = "st_proj_highlight_seen_";
 
 function loadProjectHighlightSeen(userId) {
@@ -418,7 +473,7 @@ function withActivity(prev, next, by) {
   const added = diffProjectActivity(prev, next, by);
   if (!added.length) return next;
   const activity = [...added, ...(next.activity || prev?.activity || [])].slice(0, MAX_ACTIVITY);
-  return { ...next, activity };
+  return { ...next, activity, updatedAt: new Date().toISOString() };
 }
 
 function diffLicActivity(prev, next, by, projects) {
@@ -3364,6 +3419,7 @@ export default function StudioTracker() {
   const lastLocalSaveAtRef = useRef(0);
   const saveFailProtectUntilRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
+  const saveProjectsRef = useRef(null);
   const [sets,           setSets]           = useState([]);
   const [licRequests,    setLicRequests]    = useState([]);
   const [salesRequests,  setSalesRequests]  = useState([]);
@@ -3533,15 +3589,26 @@ export default function StudioTracker() {
 
     const applyRemote = (setter, raw, normalize) => {
       try {
-        // Avoid stomping local edits while a save is in flight, just finished, or failed and retrying
         if (setter === setProjects) {
           if (savingRef.current > 0) return;
           if (Date.now() < saveFailProtectUntilRef.current) return;
-          if (Date.now() - lastLocalSaveAtRef.current < 5000) return;
         }
         let data = JSON.parse(raw);
-        if (normalize && Array.isArray(data)) data = data.map(normalizeProjectForSave);
-        setter(prev => (normalize ? mergeProjectHighlights(data, prev) : data));
+        if (normalize && Array.isArray(data)) {
+          data = data.map(normalizeProjectForSave);
+          setProjects(prev => {
+            const { merged, localWins } = mergeProjectsBoard(prev, data);
+            const next = mergeProjectHighlights(merged, prev);
+            projectsRef.current = next;
+            // Heal cloud if this client still has newer moves/creates
+            if (localWins && Date.now() - lastLocalSaveAtRef.current < 60000) {
+              queueMicrotask(() => saveProjectsRef.current?.(next));
+            }
+            return next;
+          });
+          return;
+        }
+        setter(() => data);
       } catch {
         /* ignore malformed payloads */
       }
@@ -3564,15 +3631,18 @@ export default function StudioTracker() {
       (() => {});
 
     const reloadFromCloud = () => {
-      // Don't clobber in-progress or just-finished local saves with a stale cloud snapshot
       if (savingRef.current > 0) return;
       if (Date.now() < saveFailProtectUntilRef.current) return;
-      if (Date.now() - lastLocalSaveAtRef.current < 5000) return;
       Promise.all([load(), loadSS(), loadLic(), loadSalesReq()]).then(([p, s, l, sr]) => {
         if (!active) return;
         if (savingRef.current > 0) return;
-        if (Date.now() < saveFailProtectUntilRef.current) return;
-        setProjects(p);
+        setProjects(prev => {
+          const { merged, localWins } = mergeProjectsBoard(prev, Array.isArray(p) ? p : []);
+          const next = mergeProjectHighlights(merged, prev);
+          projectsRef.current = next;
+          if (localWins) queueMicrotask(() => saveProjectsRef.current?.(next));
+          return next;
+        });
         setSets(s);
         setLicRequests(Array.isArray(l) ? l : []);
         setSalesRequests(Array.isArray(sr) ? sr : []);
@@ -3634,6 +3704,7 @@ export default function StudioTracker() {
     saveChainRef.current = queued.catch(() => {});
     return queued;
   }, [pushUndo, flash]);
+  saveProjectsRef.current = saveProjects;
 
   const handleAssign = useCallback((id, name) => {
     if (!canEditProjects) return;
