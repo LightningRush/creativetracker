@@ -149,14 +149,8 @@ function createSupabaseStorage(url, anonKey) {
         return { value: pending.value, source: "local-pending" };
       }
 
-      // After refresh, memory pending is gone — but localStorage may still be newer
-      // than a cloud row that never stuck (or was overwritten). Keep local & re-push.
-      if (local && isFresher(local, remoteValue)) {
-        lastLocalWrite[key] = { value: local, at: Date.now() };
-        scheduleHeal(key, local);
-        return { value: local, source: "local-newer" };
-      }
-
+      // Prefer cloud as source of truth. Do NOT re-push "fresher" localStorage —
+      // that caused multi-user undo (stale tab overwrote the team board).
       localStorage.setItem(key, remoteValue);
       if (pending && remoteValue === pending.value) {
         delete lastLocalWrite[key];
@@ -168,6 +162,7 @@ function createSupabaseStorage(url, anonKey) {
       return { value: pending.value, source: "local-pending" };
     }
 
+    // Cloud empty — seed once from local if present
     if (local) {
       scheduleHeal(key, local);
       return { value: local, source: "local-fallback" };
@@ -282,8 +277,6 @@ function createSupabaseStorage(url, anonKey) {
       ) {
         return;
       }
-      // Don't let an older poll overwrite a fresher in-memory board
-      if (last && isFresher(last, row.value)) return;
       last = row.value;
       onValue(row.value);
     };
