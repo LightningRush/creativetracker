@@ -154,6 +154,51 @@ const normalizeProjectForSave = (p) => {
   return { ...rest, assignees };
 };
 
+const DRAWER_MERGE_FIELDS = [
+  "title", "notes", "stage", "category", "season", "startDate", "dueDate",
+  "assignees", "priority", "waitingOnSales", "waitingOnLicenses", "followUps",
+  "styleNumbers", "projectType", "customer", "sourcePresId", "presentationId",
+];
+
+function cloneProjectSnapshot(p) {
+  if (!p) return null;
+  try {
+    return JSON.parse(JSON.stringify(normalizeProjectForSave(p)));
+  } catch {
+    return normalizeProjectForSave({ ...p });
+  }
+}
+
+function fieldValuesEqual(a, b) {
+  if (a === b) return true;
+  try {
+    return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  } catch {
+    return false;
+  }
+}
+
+function isDrawerDirty(form, base) {
+  if (!base) return true;
+  return DRAWER_MERGE_FIELDS.some(k => !fieldValuesEqual(form?.[k], base?.[k]));
+}
+
+/**
+ * Apply only fields the user changed in the drawer onto the latest board
+ * project — prevents a stale open drawer/autosave from wiping teammates' edits.
+ */
+function mergeDrawerOntoCurrent(current, form, base) {
+  if (!current) return normalizeProjectForSave(form);
+  if (!base) return normalizeProjectForSave({ ...current, ...form });
+  const next = { ...current };
+  for (const k of DRAWER_MERGE_FIELDS) {
+    if (!fieldValuesEqual(form?.[k], base?.[k])) {
+      next[k] = form?.[k];
+    }
+  }
+  return normalizeProjectForSave(next);
+}
+
 /** Best-effort "how fresh is this project" for sync merges */
 function projectSyncTime(p) {
   if (!p) return 0;
@@ -1950,6 +1995,9 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
   const skipAutoSaveRef = useRef(true);
   const formRef = useRef(form);
   formRef.current = form;
+  const baseRef = useRef(cloneProjectSnapshot(
+    project ? { ...project, assignees: projectAssignees(project) } : null
+  ));
 
   const buildPayload = useCallback(() => normalizeProjectForSave({
     ...formRef.current,
@@ -1961,20 +2009,50 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
     if (readOnly) return false;
     const title = formRef.current.title?.trim();
     if (!title) return false;
+    if (!isNew && !isDrawerDirty(formRef.current, baseRef.current)) {
+      setSaveState("saved");
+      return true;
+    }
     setSaveState("saving");
     try {
-      await onSave(buildPayload(), { close: false, silent: opts.silent !== false });
+      const updated = await onSave(buildPayload(), {
+        close: false,
+        silent: opts.silent !== false,
+        base: baseRef.current,
+      });
+      if (updated) {
+        baseRef.current = cloneProjectSnapshot(updated);
+        setForm(f => ({
+          ...f,
+          updatedAt: updated.updatedAt,
+          activity: updated.activity,
+        }));
+      }
       setSaveState("saved");
       return true;
     } catch {
       setSaveState("error");
       return false;
     }
-  }, [readOnly, onSave, buildPayload]);
+  }, [readOnly, onSave, buildPayload, isNew]);
 
   const handleManualSave = useCallback(() => {
     flushSave({ silent: false });
   }, [flushSave]);
+
+  // Teammate updated this card and we have no local edits — refresh open drawer
+  useEffect(() => {
+    if (isNew || readOnly || !form.id) return;
+    const live = allProjects.find(p => p.id === form.id);
+    if (!live) return;
+    if (isDrawerDirty(formRef.current, baseRef.current)) return;
+    if (projectSyncTime(live) <= projectSyncTime(baseRef.current)) return;
+    const snap = { ...live, assignees: projectAssignees(live) };
+    baseRef.current = cloneProjectSnapshot(snap);
+    skipAutoSaveRef.current = true;
+    setForm(snap);
+    setSaveState("saved");
+  }, [allProjects, form.id, isNew, readOnly]);
 
   useEffect(() => {
     if (readOnly) return;
@@ -1986,10 +2064,14 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
       setSaveState("idle");
       return;
     }
+    if (!isNew && !isDrawerDirty(form, baseRef.current)) {
+      setSaveState("saved");
+      return;
+    }
     setSaveState("pending");
     const t = setTimeout(() => flushSave({ silent: true }), 800);
     return () => clearTimeout(t);
-  }, [form, readOnly, flushSave]);
+  }, [form, readOnly, flushSave, isNew]);
   const isPresentation = form.projectType === "presentation";
   const setStage = (stageId) => {
     setForm(f => ({
@@ -3597,11 +3679,13 @@ export default function StudioTracker() {
         if (normalize && Array.isArray(data)) {
           data = data.map(normalizeProjectForSave);
           setProjects(prev => {
-            const { merged, localWins } = mergeProjectsBoard(prev, data);
+            const { merged } = mergeProjectsBoard(prev, data);
             const next = mergeProjectHighlights(merged, prev);
             projectsRef.current = next;
-            // Heal cloud if this client still has newer moves/creates
-            if (localWins && Date.now() - lastLocalSaveAtRef.current < 60000) {
+            // Only re-push if this client created cards the cloud doesn't have yet
+            const remoteIds = new Set(data.map(p => p?.id).filter(Boolean));
+            const hasLocalCreates = prev.some(p => p?.id && !remoteIds.has(p.id));
+            if (hasLocalCreates && Date.now() - lastLocalSaveAtRef.current < 60000) {
               queueMicrotask(() => saveProjectsRef.current?.(next));
             }
             return next;
@@ -3637,10 +3721,13 @@ export default function StudioTracker() {
         if (!active) return;
         if (savingRef.current > 0) return;
         setProjects(prev => {
-          const { merged, localWins } = mergeProjectsBoard(prev, Array.isArray(p) ? p : []);
+          const remote = Array.isArray(p) ? p : [];
+          const { merged } = mergeProjectsBoard(prev, remote);
           const next = mergeProjectHighlights(merged, prev);
           projectsRef.current = next;
-          if (localWins) queueMicrotask(() => saveProjectsRef.current?.(next));
+          const remoteIds = new Set(remote.map(x => x?.id).filter(Boolean));
+          const hasLocalCreates = prev.some(x => x?.id && !remoteIds.has(x.id));
+          if (hasLocalCreates) queueMicrotask(() => saveProjectsRef.current?.(next));
           return next;
         });
         setSets(s);
@@ -3762,13 +3849,19 @@ export default function StudioTracker() {
   }, [saveProjects, categoryFilter, assigneeFilter, boardMode, canEditProjects, actor]);
 
   const handleSave = (data, opts = {}) => {
-    if (!canEditProjects) return Promise.resolve();
-    const { close = true, silent = false } = opts;
+    if (!canEditProjects) {
+      return Promise.reject(new Error("You don’t have edit access on the team board"));
+    }
+    const { close = true, silent = false, base = null } = opts;
     const list = projectsRef.current;
     const exists = list.some(p => p.id === data.id);
     const prev = exists ? list.find(p => p.id === data.id) : null;
+    // Overlay only drawer-dirty fields onto the latest board card (not a stale full form)
+    const mergedForm = exists && prev
+      ? mergeDrawerOntoCurrent(prev, data, base || prev)
+      : data;
     const prevAs = prev ? projectAssignees(prev) : [];
-    const nextAs = projectAssignees(data);
+    const nextAs = projectAssignees(mergedForm);
     const addedAssignees = nextAs.filter(n => !prevAs.includes(n));
     const now = new Date().toISOString();
     const highlightPatch = !exists
@@ -3780,15 +3873,20 @@ export default function StudioTracker() {
         ? { assignHighlightAt: now, assignHighlightFor: addedAssignees }
         : {};
     const payload = normalizeProjectForSave({
-      ...data,
+      ...mergedForm,
       ...highlightPatch,
-      styleNumbers: normalizeStyleEntries(data.styleNumbers),
+      styleNumbers: normalizeStyleEntries(mergedForm.styleNumbers),
     });
     const updated = withActivity(prev, payload, actor);
+    // No drawer edits vs base — skip cloud write (stops autosave undo ping-pong)
+    if (exists && !isDrawerDirty(data, base || prev) && !addedAssignees.length) {
+      return Promise.resolve(prev);
+    }
     const next = exists ? list.map(p => p.id === data.id ? updated : p) : [...list, updated];
-    const savePromise = silent
+    const savePromise = (silent
       ? saveProjects(next)
-      : saveProjects(next, { undoSnapshot: list });
+      : saveProjects(next, { undoSnapshot: list })
+    ).then(() => updated);
     if (close) {
       setDrawer(null);
     } else if (!exists) {
