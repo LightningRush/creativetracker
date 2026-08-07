@@ -1902,17 +1902,17 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
     styleNumbers: normalizeStyleEntries(formRef.current.styleNumbers),
   }), []);
 
-  const flushSave = useCallback((opts = {}) => {
+  const flushSave = useCallback(async (opts = {}) => {
     if (readOnly) return false;
     const title = formRef.current.title?.trim();
     if (!title) return false;
     setSaveState("saving");
     try {
-      onSave(buildPayload(), { close: false, silent: opts.silent !== false });
+      await onSave(buildPayload(), { close: false, silent: opts.silent !== false });
       setSaveState("saved");
       return true;
     } catch {
-      setSaveState("pending");
+      setSaveState("error");
       return false;
     }
   }, [readOnly, onSave, buildPayload]);
@@ -1949,7 +1949,7 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
 
   const requestClose = useCallback(() => {
     if (closing) return;
-    flushSave();
+    void flushSave({ silent: true });
     setClosing(true);
     setTimeout(() => onClose?.(), 180);
   }, [closing, onClose, flushSave]);
@@ -2172,7 +2172,10 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
                 </button>
                 {form.title.trim() && (
                   <div className={`drawer-save-status drawer-save-status--${saveState}`} aria-live="polite">
-                    {saveState === "saving" ? "Saving…" : saveState === "pending" ? "Unsaved changes — autosaving…" : "Saved"}
+                    {saveState === "saving" ? "Saving…"
+                      : saveState === "pending" ? "Unsaved changes — autosaving…"
+                      : saveState === "error" ? "Save failed — tap Save to retry"
+                      : "Saved"}
                   </div>
                 )}
                 {!isNew && (
@@ -3355,6 +3358,10 @@ export default function StudioTracker() {
   const canCreateLicensing = isMaster || (canEdit && hasLicensingAccess);
   const canResolveLicensing = isMaster || (canEdit && !isLicensingTeam);
   const [projects,       setProjects]       = useState([]);
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const savingRef = useRef(0);
+  const lastLocalSaveAtRef = useRef(0);
   const [sets,           setSets]           = useState([]);
   const [licRequests,    setLicRequests]    = useState([]);
   const [salesRequests,  setSalesRequests]  = useState([]);
@@ -3524,6 +3531,11 @@ export default function StudioTracker() {
 
     const applyRemote = (setter, raw, normalize) => {
       try {
+        // Avoid stomping local edits while a save is in flight or just finished
+        if (setter === setProjects) {
+          if (savingRef.current > 0) return;
+          if (Date.now() - lastLocalSaveAtRef.current < 2000) return;
+        }
         let data = JSON.parse(raw);
         if (normalize && Array.isArray(data)) data = data.map(normalizeProjectForSave);
         setter(prev => (normalize ? mergeProjectHighlights(data, prev) : data));
@@ -3549,8 +3561,12 @@ export default function StudioTracker() {
       (() => {});
 
     const reloadFromCloud = () => {
+      // Don't clobber in-progress or just-finished local saves with a stale cloud snapshot
+      if (savingRef.current > 0) return;
+      if (Date.now() - lastLocalSaveAtRef.current < 2500) return;
       Promise.all([load(), loadSS(), loadLic(), loadSalesReq()]).then(([p, s, l, sr]) => {
         if (!active) return;
+        if (savingRef.current > 0) return;
         setProjects(p);
         setSets(s);
         setLicRequests(Array.isArray(l) ? l : []);
@@ -3576,20 +3592,27 @@ export default function StudioTracker() {
   const saveProjects = useCallback(async (next, opts) => {
     const message = typeof opts === "string" ? opts : opts?.message;
     const undoSnapshot = typeof opts === "object" && opts?.undoSnapshot != null ? opts.undoSnapshot : null;
+    savingRef.current += 1;
+    projectsRef.current = next;
     setProjects(next);
     try {
       await save(next);
+      lastLocalSaveAtRef.current = Date.now();
       if (undoSnapshot) pushUndo(undoSnapshot, message);
       else if (message) flash(message);
     } catch (e) {
       console.error(e);
       flash("Could not save — team may not see this change");
+      throw e;
+    } finally {
+      savingRef.current = Math.max(0, savingRef.current - 1);
     }
   }, [pushUndo, flash]);
 
   const handleAssign = useCallback((id, name) => {
     if (!canEditProjects) return;
-    const proj = projects.find(p => p.id === id);
+    const list = projectsRef.current;
+    const proj = list.find(p => p.id === id);
     if (!proj) return;
     const current = projectAssignees(proj);
     if (current.includes(name)) return;
@@ -3600,16 +3623,17 @@ export default function StudioTracker() {
       assignHighlightAt: new Date().toISOString(),
       assignHighlightFor: [name],
     }), actor);
-    const next = projects.map(p => p.id === id ? updated : p);
-    saveProjects(next, { message: `Added ${name} to "${proj.title}"`, undoSnapshot: projects });
-  }, [projects, saveProjects, actor, canEditProjects]);
+    const next = list.map(p => p.id === id ? updated : p);
+    saveProjects(next, { message: `Added ${name} to "${proj.title}"`, undoSnapshot: list });
+  }, [saveProjects, actor, canEditProjects]);
 
   const handleReorder = useCallback((id, newStage, beforeId) => {
     if (!canEditProjects) return;
-    const proj = projects.find(p => p.id === id);
+    const list = projectsRef.current;
+    const proj = list.find(p => p.id === id);
     if (!proj) return;
     const prevStage = proj.stage;
-    let next = projects.filter(p => p.id !== id);
+    let next = list.filter(p => p.id !== id);
     const updated = withActivity(proj, { ...proj, stage: newStage }, actor);
     if (beforeId) { const i = next.findIndex(p => p.id === beforeId); next.splice(i >= 0 ? i : next.length, 0, updated); }
     else { const idxs = next.map((p, i) => p.stage === newStage ? i : -1).filter(i => i >= 0); next.splice(idxs.length ? idxs[idxs.length - 1] + 1 : next.length, 0, updated); }
@@ -3617,14 +3641,15 @@ export default function StudioTracker() {
     if (prevStage !== newStage) stagesToRenumber.add(prevStage);
     next = applyBoardOrderForStages(next, stagesToRenumber);
     const msg = proj.stage !== newStage ? `Moved to ${stageOf(newStage).label}` : "Reordered";
-    saveProjects(next, { message: msg, undoSnapshot: projects });
-  }, [projects, saveProjects, actor, canEditProjects]);
+    saveProjects(next, { message: msg, undoSnapshot: list });
+  }, [saveProjects, actor, canEditProjects]);
 
   const handleQuickAdd = useCallback((stageId, title) => {
     if (!canEditProjects) return;
+    const list = projectsRef.current;
     const assignees = assigneeFilter ? [assigneeFilter] : [];
     const now = new Date().toISOString();
-    const inStage = projects.filter(p => p.stage === stageId);
+    const inStage = list.filter(p => p.stage === stageId);
     const maxOrder = inStage.reduce((m, p) => Math.max(m, typeof p.boardOrder === "number" ? p.boardOrder : -1), -1);
     const p = {
       id: `p${Date.now()}`, title, stage: stageId,
@@ -3636,14 +3661,15 @@ export default function StudioTracker() {
       ...(assignees.length ? { assignHighlightAt: now, assignHighlightFor: assignees } : {}),
     };
     const created = withActivity(null, p, actor);
-    saveProjects([...projects, created], { message: `Added "${title}"`, undoSnapshot: projects });
-  }, [projects, saveProjects, categoryFilter, assigneeFilter, boardMode, canEditProjects, actor]);
+    saveProjects([...list, created], { message: `Added "${title}"`, undoSnapshot: list });
+  }, [saveProjects, categoryFilter, assigneeFilter, boardMode, canEditProjects, actor]);
 
   const handleSave = (data, opts = {}) => {
-    if (!canEditProjects) return;
+    if (!canEditProjects) return Promise.resolve();
     const { close = true, silent = false } = opts;
-    const exists = projects.some(p => p.id === data.id);
-    const prev = exists ? projects.find(p => p.id === data.id) : null;
+    const list = projectsRef.current;
+    const exists = list.some(p => p.id === data.id);
+    const prev = exists ? list.find(p => p.id === data.id) : null;
     const prevAs = prev ? projectAssignees(prev) : [];
     const nextAs = projectAssignees(data);
     const addedAssignees = nextAs.filter(n => !prevAs.includes(n));
@@ -3662,17 +3688,16 @@ export default function StudioTracker() {
       styleNumbers: normalizeStyleEntries(data.styleNumbers),
     });
     const updated = withActivity(prev, payload, actor);
-    const next = exists ? projects.map(p => p.id === data.id ? updated : p) : [...projects, updated];
-    if (silent) {
-      saveProjects(next);
-    } else {
-      saveProjects(next, { undoSnapshot: projects });
-    }
+    const next = exists ? list.map(p => p.id === data.id ? updated : p) : [...list, updated];
+    const savePromise = silent
+      ? saveProjects(next)
+      : saveProjects(next, { undoSnapshot: list });
     if (close) {
       setDrawer(null);
     } else if (!exists) {
       setDrawer({ project: updated, isNew: false });
     }
+    return savePromise;
   };
 
   const handleMoveBoard = (data, targetType) => {
@@ -4773,6 +4798,7 @@ export default function StudioTracker() {
         .drawer-footer-actions { display: flex; flex-direction: column; gap: 6px; width: 100%; }
         .drawer-save-status { font-size: 11px; font-weight: 600; text-align: center; padding: 2px 0 0; color: #56566A; }
         .drawer-save-status--saved { color: #34D399; }
+        .drawer-save-status--error { color: #F87171; }
         .drawer-save-status--saving, .drawer-save-status--pending { color: #9494B0; }
         .drawer-footer-delete-row { display: flex; justify-content: flex-end; min-height: 28px; }
         .drawer-delete-confirm--compact { display: flex; gap: 6px; justify-content: flex-end; }
