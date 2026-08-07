@@ -3362,6 +3362,8 @@ export default function StudioTracker() {
   projectsRef.current = projects;
   const savingRef = useRef(0);
   const lastLocalSaveAtRef = useRef(0);
+  const saveFailProtectUntilRef = useRef(0);
+  const saveChainRef = useRef(Promise.resolve());
   const [sets,           setSets]           = useState([]);
   const [licRequests,    setLicRequests]    = useState([]);
   const [salesRequests,  setSalesRequests]  = useState([]);
@@ -3531,10 +3533,11 @@ export default function StudioTracker() {
 
     const applyRemote = (setter, raw, normalize) => {
       try {
-        // Avoid stomping local edits while a save is in flight or just finished
+        // Avoid stomping local edits while a save is in flight, just finished, or failed and retrying
         if (setter === setProjects) {
           if (savingRef.current > 0) return;
-          if (Date.now() - lastLocalSaveAtRef.current < 2000) return;
+          if (Date.now() < saveFailProtectUntilRef.current) return;
+          if (Date.now() - lastLocalSaveAtRef.current < 5000) return;
         }
         let data = JSON.parse(raw);
         if (normalize && Array.isArray(data)) data = data.map(normalizeProjectForSave);
@@ -3563,10 +3566,12 @@ export default function StudioTracker() {
     const reloadFromCloud = () => {
       // Don't clobber in-progress or just-finished local saves with a stale cloud snapshot
       if (savingRef.current > 0) return;
-      if (Date.now() - lastLocalSaveAtRef.current < 2500) return;
+      if (Date.now() < saveFailProtectUntilRef.current) return;
+      if (Date.now() - lastLocalSaveAtRef.current < 5000) return;
       Promise.all([load(), loadSS(), loadLic(), loadSalesReq()]).then(([p, s, l, sr]) => {
         if (!active) return;
         if (savingRef.current > 0) return;
+        if (Date.now() < saveFailProtectUntilRef.current) return;
         setProjects(p);
         setSets(s);
         setLicRequests(Array.isArray(l) ? l : []);
@@ -3589,24 +3594,45 @@ export default function StudioTracker() {
     };
   }, []);
 
-  const saveProjects = useCallback(async (next, opts) => {
+  const saveProjects = useCallback((next, opts) => {
     const message = typeof opts === "string" ? opts : opts?.message;
     const undoSnapshot = typeof opts === "object" && opts?.undoSnapshot != null ? opts.undoSnapshot : null;
-    savingRef.current += 1;
     projectsRef.current = next;
     setProjects(next);
-    try {
-      await save(next);
-      lastLocalSaveAtRef.current = Date.now();
-      if (undoSnapshot) pushUndo(undoSnapshot, message);
-      else if (message) flash(message);
-    } catch (e) {
-      console.error(e);
-      flash("Could not save — team may not see this change");
-      throw e;
-    } finally {
-      savingRef.current = Math.max(0, savingRef.current - 1);
-    }
+
+    const run = async () => {
+      savingRef.current += 1;
+      let attempt = 0;
+      try {
+        while (true) {
+          // Always persist the latest board — not a stale snapshot from when this save was queued
+          const payload = projectsRef.current;
+          try {
+            await save(payload);
+            lastLocalSaveAtRef.current = Date.now();
+            saveFailProtectUntilRef.current = 0;
+            if (undoSnapshot) pushUndo(undoSnapshot, message);
+            else if (message) flash(message);
+            return;
+          } catch (e) {
+            attempt += 1;
+            console.error(e);
+            if (attempt >= 3) {
+              saveFailProtectUntilRef.current = Date.now() + 30000;
+              flash("Could not save to team board — retrying kept your changes on screen. Check connection.");
+              throw e;
+            }
+            await new Promise(r => setTimeout(r, 400 * attempt));
+          }
+        }
+      } finally {
+        savingRef.current = Math.max(0, savingRef.current - 1);
+      }
+    };
+
+    const queued = saveChainRef.current.then(run, run);
+    saveChainRef.current = queued.catch(() => {});
+    return queued;
   }, [pushUndo, flash]);
 
   const handleAssign = useCallback((id, name) => {
