@@ -6,6 +6,16 @@ const SELECT_SETS_KEY = "ss_v1";
 /** Prefer a recent local write while the cloud upsert may still be in flight */
 const LOCAL_WRITE_GRACE_MS = 8000;
 
+function asStoredString(value) {
+  if (value == null) return null;
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
 function createLocalStorage() {
   return {
     async get(key) {
@@ -52,16 +62,18 @@ function createSupabaseStorage(url, anonKey) {
       Date.now() - pending.at < LOCAL_WRITE_GRACE_MS &&
       pending.value;
 
-    if (data?.value) {
-      // Cloud still has older data while our upsert is in flight — keep local
-      if (pendingFresh && data.value !== pending.value) {
+    const remoteValue = asStoredString(data?.value);
+
+    if (remoteValue) {
+      // Cloud still has older data while our write is in flight — keep local
+      if (pendingFresh && remoteValue !== pending.value) {
         return { value: pending.value, source: "local-pending" };
       }
-      localStorage.setItem(key, data.value);
-      if (pending && data.value === pending.value) {
+      localStorage.setItem(key, remoteValue);
+      if (pending && remoteValue === pending.value) {
         delete lastLocalWrite[key];
       }
-      return { value: data.value, source: "cloud" };
+      return { value: remoteValue, source: "cloud" };
     }
 
     if (pendingFresh) {
@@ -74,31 +86,75 @@ function createSupabaseStorage(url, anonKey) {
   }
 
   async function set(key, value) {
-    const isEmpty = !value || value === "[]" || value === "null";
+    const str = asStoredString(value);
+    if (str == null) throw new Error("Invalid board data — cannot save");
+
+    const isEmpty = !str || str === "[]" || str === "null";
     const protectAgainstWipe = key === PROJECTS_KEY || key === SELECT_SETS_KEY;
     if (protectAgainstWipe && isEmpty) {
       const { data } = await supabase.from(TABLE).select("value").eq("key", key).maybeSingle();
-      if (data?.value && data.value !== "[]") {
+      if (data?.value != null && asStoredString(data.value) !== "[]") {
         console.warn("[storage] Blocked empty save — team data already exists for", key);
-        return;
+        throw new Error("Blocked empty save — refusing to wipe the team board");
       }
     }
 
-    lastLocalWrite[key] = { value, at: Date.now() };
-    localStorage.setItem(key, value);
+    const updated_at = new Date().toISOString();
+    lastLocalWrite[key] = { value: str, at: Date.now() };
+    localStorage.setItem(key, str);
 
-    const { error } = await supabase.from(TABLE).upsert(
-      { key, value, updated_at: new Date().toISOString() },
-      { onConflict: "key" }
-    );
+    // Prefer update-then-insert so we don't depend on upsert/onConflict setup
+    const { data: existing, error: existErr } = await supabase
+      .from(TABLE)
+      .select("key")
+      .eq("key", key)
+      .maybeSingle();
 
-    if (error) {
-      console.error("[storage] Supabase save failed:", error.message, error);
-      throw new Error(error.message || "Could not save to team board");
+    if (existErr) {
+      console.error("[storage] Supabase lookup failed:", existErr.message, existErr);
+      throw new Error(existErr.message || "Could not reach team board");
     }
 
-    // Confirm cloud caught up — keep grace briefly for slow replicas
-    lastLocalWrite[key] = { value, at: Date.now() };
+    let writeErr = null;
+    if (existing?.key) {
+      const { error } = await supabase
+        .from(TABLE)
+        .update({ value: str, updated_at })
+        .eq("key", key);
+      writeErr = error;
+    } else {
+      const { error } = await supabase
+        .from(TABLE)
+        .insert({ key, value: str, updated_at });
+      writeErr = error;
+    }
+
+    if (writeErr) {
+      console.error("[storage] Supabase save failed:", writeErr.message, writeErr);
+      throw new Error(writeErr.message || "Could not save to team board");
+    }
+
+    // Verify the cloud actually has what we wrote (catches RLS "success" no-ops)
+    const { data: check, error: checkErr } = await supabase
+      .from(TABLE)
+      .select("value")
+      .eq("key", key)
+      .maybeSingle();
+
+    if (checkErr) {
+      console.error("[storage] Save verify failed:", checkErr.message, checkErr);
+      throw new Error(checkErr.message || "Could not verify team board save");
+    }
+
+    const checkVal = asStoredString(check?.value);
+    if (checkVal !== str) {
+      console.error("[storage] Save verify mismatch — cloud did not keep our write");
+      throw new Error(
+        "Save did not stick on the team board (check Supabase RLS UPDATE policy for tracker_state)"
+      );
+    }
+
+    lastLocalWrite[key] = { value: str, at: Date.now() };
   }
 
   function subscribe(key, onValue) {
@@ -106,7 +162,6 @@ function createSupabaseStorage(url, anonKey) {
 
     const applyIfChanged = (row) => {
       if (row?.value == null || row.value === last) return;
-      // Don't push a stale cloud snapshot over a pending local write
       if (row.source === "local-pending") {
         last = row.value;
         return;
