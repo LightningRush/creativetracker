@@ -3,6 +3,9 @@ import { createClient } from "@supabase/supabase-js";
 const PROJECTS_KEY = "st_v10";
 const SELECT_SETS_KEY = "ss_v1";
 
+/** Prefer a recent local write while the cloud upsert may still be in flight */
+const LOCAL_WRITE_GRACE_MS = 8000;
+
 function createLocalStorage() {
   return {
     async get(key) {
@@ -26,6 +29,9 @@ function createSupabaseStorage(url, anonKey) {
   const TABLE = "tracker_state";
   const KEYS = [PROJECTS_KEY, SELECT_SETS_KEY];
 
+  /** Latest value we intentionally wrote — keeps polls from clobbering mid-save */
+  const lastLocalWrite = Object.create(null);
+
   async function get(key) {
     const { data, error } = await supabase
       .from(TABLE)
@@ -40,9 +46,26 @@ function createSupabaseStorage(url, anonKey) {
       throw error;
     }
 
+    const pending = lastLocalWrite[key];
+    const pendingFresh =
+      pending &&
+      Date.now() - pending.at < LOCAL_WRITE_GRACE_MS &&
+      pending.value;
+
     if (data?.value) {
+      // Cloud still has older data while our upsert is in flight — keep local
+      if (pendingFresh && data.value !== pending.value) {
+        return { value: pending.value, source: "local-pending" };
+      }
       localStorage.setItem(key, data.value);
+      if (pending && data.value === pending.value) {
+        delete lastLocalWrite[key];
+      }
       return { value: data.value, source: "cloud" };
+    }
+
+    if (pendingFresh) {
+      return { value: pending.value, source: "local-pending" };
     }
 
     const local = localStorage.getItem(key);
@@ -61,6 +84,7 @@ function createSupabaseStorage(url, anonKey) {
       }
     }
 
+    lastLocalWrite[key] = { value, at: Date.now() };
     localStorage.setItem(key, value);
 
     const { error } = await supabase.from(TABLE).upsert(
@@ -72,10 +96,32 @@ function createSupabaseStorage(url, anonKey) {
       console.error("[storage] Supabase save failed:", error.message, error);
       throw new Error(error.message || "Could not save to team board");
     }
+
+    // Confirm cloud caught up — keep grace briefly for slow replicas
+    lastLocalWrite[key] = { value, at: Date.now() };
   }
 
   function subscribe(key, onValue) {
-    let last = localStorage.getItem(key);
+    let last = lastLocalWrite[key]?.value ?? localStorage.getItem(key);
+
+    const applyIfChanged = (row) => {
+      if (row?.value == null || row.value === last) return;
+      // Don't push a stale cloud snapshot over a pending local write
+      if (row.source === "local-pending") {
+        last = row.value;
+        return;
+      }
+      const pending = lastLocalWrite[key];
+      if (
+        pending &&
+        Date.now() - pending.at < LOCAL_WRITE_GRACE_MS &&
+        row.value !== pending.value
+      ) {
+        return;
+      }
+      last = row.value;
+      onValue(row.value);
+    };
 
     const channel = supabase
       .channel(`tracker_state:${key}`)
@@ -89,11 +135,7 @@ function createSupabaseStorage(url, anonKey) {
         },
         async () => {
           try {
-            const row = await get(key);
-            if (row?.value != null && row.value !== last) {
-              last = row.value;
-              onValue(row.value);
-            }
+            applyIfChanged(await get(key));
           } catch {
             /* ignore */
           }
@@ -103,11 +145,7 @@ function createSupabaseStorage(url, anonKey) {
 
     const poll = setInterval(async () => {
       try {
-        const row = await get(key);
-        if (row?.value != null && row.value !== last) {
-          last = row.value;
-          onValue(row.value);
-        }
+        applyIfChanged(await get(key));
       } catch {
         /* ignore */
       }
