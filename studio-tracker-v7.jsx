@@ -1102,7 +1102,7 @@ function FocusFilterBar({
 }) {
   const chips = (
     <div className={`filter-signal-group ${boardTagFilter ? "has-active-filter" : ""}`}>
-      <span className="filter-group-label">Focus</span>
+      <span className="filter-group-label">Filters</span>
       <div className="signal-chip-row">
         {priorityCount > 0 && (
           <SignalFilterChip
@@ -1254,7 +1254,18 @@ function ProjectFlags({ project, compact = false }) {
 }
 
 // ─── BOARD CARD ──────────────────────────────────────────────────────────────
-function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, onDelete, canEdit = true, isNewHighlight = false }) {
+function BoardCard({
+  project,
+  isDragging,
+  isDropTarget,
+  onPointerDown,
+  onOpen,
+  onDelete,
+  onStageChange,
+  stages = STAGES,
+  canEdit = true,
+  isNewHighlight = false,
+}) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const days    = daysUntil(project.dueDate);
   const overdue = days !== null && days < 0;
@@ -1263,7 +1274,13 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, o
   const pr       = priorityOf(project);
   const licenses = isWaitingOnLicenses(project);
   const salesHold = isWaitingOnSalesInfo(project) || isWaitingOnSalesProduct(project);
-  const statusHints = cardStatusHints(project);
+  // Keep cards quiet: priority first, then one other signal max
+  const slimHints = (() => {
+    const all = cardStatusHints(project);
+    const priority = all.filter(h => h.key === "priority");
+    const rest = all.filter(h => h.key !== "priority");
+    return [...priority, ...rest].slice(0, 2);
+  })();
 
   return (
     <div
@@ -1301,10 +1318,9 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, o
       <div className="card-stripe" />
       <div className="card-body">
         <div className="card-title">{project.title}</div>
-        <div className="card-meta">{catLabel(project.category)} · {project.season}</div>
-        {statusHints.length > 0 && (
+        {slimHints.length > 0 && (
           <div className="card-status-flags">
-            {statusHints.map(h => (
+            {slimHints.map(h => (
               <span key={h.key} className={`card-meta-flag tone-${h.tone}`}>{h.label}</span>
             ))}
           </div>
@@ -1321,6 +1337,24 @@ function BoardCard({ project, isDragging, isDropTarget, onPointerDown, onOpen, o
             )}
           </div>
         </div>
+        {canEdit && onStageChange && (
+          <div
+            className="card-stage-row"
+            onClick={e => e.stopPropagation()}
+            onPointerDown={e => e.stopPropagation()}
+          >
+            <select
+              className="card-stage-select"
+              value={project.stage}
+              aria-label="Move stage"
+              onChange={e => onStageChange(project.id, e.target.value)}
+            >
+              {stages.map(s => (
+                <option key={s.id} value={s.id}>{s.label}</option>
+              ))}
+            </select>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1513,50 +1547,48 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, onDelete, st
 
   const toggleCollapse = (id) => setCollapsed(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const isDC = drag?.kind === "card", isDT = drag?.kind === "team";
+  const [assignOpen, setAssignOpen] = useState(false);
+  const showAssignStrip = canEdit && (assignOpen || isDC || isDT);
 
   return (
     <>
       <div className="board-tools-row">
-        <div className="team-strip">
-          <span className="strip-label">Team</span>
-          <div className="team-row">
-            {TEAM.map(t => {
-              const isChipDrop    = isDC && hover?.type === "assignee" && hover.value === t.name;
-              const isBeingDragged = isDT && drag.name === t.name;
-              return (
-                <div key={t.name} data-assignee={t.name}
-                  onPointerDown={canEdit ? (e) => handleTeamPointerDown(e, t) : undefined}
-                  className={`team-chip ${isChipDrop ? "chip-on" : ""} ${isBeingDragged ? "chip-lifting" : ""} ${!canEdit ? "team-chip-view" : ""}`}
-                  style={{ "--tc": t.color }}
-                >
-                  <span className="av av-sm" style={{ background: t.color }}>{initials(t.name)}</span>
-                  <span className="chip-name">{t.name}</span>
-                  <span className="chip-grip">⠿</span>
-                </div>
-              );
-            })}
+        {canEdit && (
+          <button
+            type="button"
+            className={`assign-toggle ${showAssignStrip ? "on" : ""}`}
+            onClick={() => setAssignOpen(v => !v)}
+            aria-pressed={showAssignStrip}
+          >
+            Assign
+          </button>
+        )}
+        {showAssignStrip && (
+          <div className={`team-strip ${isDC || isDT ? "team-strip--active" : ""}`}>
+            <div className="team-row">
+              {TEAM.map(t => {
+                const isChipDrop    = isDC && hover?.type === "assignee" && hover.value === t.name;
+                const isBeingDragged = isDT && drag.name === t.name;
+                return (
+                  <div key={t.name} data-assignee={t.name}
+                    onPointerDown={canEdit ? (e) => handleTeamPointerDown(e, t) : undefined}
+                    className={`team-chip ${isChipDrop ? "chip-on" : ""} ${isBeingDragged ? "chip-lifting" : ""}`}
+                    style={{ "--tc": t.color }}
+                  >
+                    <span className="av av-sm" style={{ background: t.color }}>{initials(t.name)}</span>
+                    <span className="chip-name">{t.name.split(" ")[0]}</span>
+                  </div>
+                );
+              })}
+            </div>
+            {(isDC || isDT) && (
+              <span className="strip-hint">
+                {isDC ? "Drop on teammate to assign" : "Drop on a card to assign"}
+              </span>
+            )}
           </div>
-          {(!canEdit || isDC || isDT) && (
-            <span className="strip-hint">
-              {!canEdit
-                ? "View only — click a card for details"
-                : isDC
-                  ? "Drop on teammate to assign"
-                  : "Drop on a card to assign"}
-            </span>
-          )}
-        </div>
+        )}
         {focusBar && <div className="board-tools-focus">{focusBar}</div>}
-      </div>
-
-      {/* Category legend */}
-      <div className="cat-legend">
-        {CATEGORIES.filter(c => c.id !== "all").map(c => (
-          <div key={c.id} className="legend-item">
-            <span className="legend-dot" style={{ background: c.color }} />
-            <span>{c.label}</span>
-          </div>
-        ))}
       </div>
 
       {/* Board */}
@@ -1592,7 +1624,18 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, onDelete, st
                       return (
                         <div key={p.id}>
                           {isBeforeMarker && <div className="drop-marker" />}
-                          <BoardCard project={p} isDragging={isDC && drag.project.id === p.id} isDropTarget={isTeamDropTarget} onPointerDown={handleCardPointerDown} onOpen={onOpen} onDelete={onDelete} canEdit={canEdit} isNewHighlight={isHighlighted(p)} />
+                          <BoardCard
+                            project={p}
+                            isDragging={isDC && drag.project.id === p.id}
+                            isDropTarget={isTeamDropTarget}
+                            onPointerDown={handleCardPointerDown}
+                            onOpen={onOpen}
+                            onDelete={onDelete}
+                            onStageChange={canEdit ? (id, stageId) => cbRef.current.onReorder(id, stageId, null) : undefined}
+                            stages={stages}
+                            canEdit={canEdit}
+                            isNewHighlight={isHighlighted(p)}
+                          />
                         </div>
                       );
                     })}
@@ -1977,6 +2020,37 @@ function DrawerSection({ title, defaultOpen = false, badge, children }) {
   );
 }
 
+/** Notes open fully sized to content — no manual expand needed */
+function AutoGrowTextarea({ value, onChange, className = "", minRows = 6, ...rest }) {
+  const ref = useRef(null);
+  const resize = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const line = 22;
+    const minH = minRows * line + 20;
+    el.style.height = `${Math.max(minH, el.scrollHeight)}px`;
+  }, [minRows]);
+
+  useEffect(() => {
+    resize();
+  }, [value, resize]);
+
+  return (
+    <textarea
+      {...rest}
+      ref={ref}
+      value={value}
+      rows={minRows}
+      onChange={(e) => {
+        onChange?.(e);
+        requestAnimationFrame(resize);
+      }}
+      className={`ui-input ui-textarea drawer-notes-input ${className}`.trim()}
+    />
+  );
+}
+
 // ─── DRAWER ──────────────────────────────────────────────────────────────────
 function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presentations, readOnly = false, canLogFollowUps = false, canTaskFollowUps = false, onCreateProductFromFollowUp, allProjects = [] }) {
   const [form, setForm] = useState(() => {
@@ -2104,7 +2178,6 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
   const activityCount = (form.activity || []).length;
   const showFollowUps = isPresentation && (canLogFollowUps || canTaskFollowUps || followUpItems.length > 0);
   const showSkus = !isPresentation && (isAwaitingSales || skuCount > 0);
-  const [showExtra, setShowExtra] = useState(isNew);
 
   return (
     <>
@@ -2130,6 +2203,22 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
             autoFocus={isNew && !readOnly} className="drawer-title drawer-title--focus" />
 
           <div className="drawer-focus-body">
+            {!readOnly ? (
+              <Field label="Notes">
+                <AutoGrowTextarea
+                  minRows={6}
+                  value={form.notes}
+                  onChange={e => set("notes", e.target.value)}
+                  placeholder="What’s happening on this project?"
+                />
+              </Field>
+            ) : form.notes?.trim() ? (
+              <div className="drawer-posted-notes drawer-posted-notes--inline">
+                <div className="field-label">Notes</div>
+                <div className="notes-rendered"><LinkedText text={form.notes} /></div>
+              </div>
+            ) : null}
+
             <Field label="Stage">
               <Select value={form.stage} onChange={e => setStage(e.target.value)} disabled={readOnly} className="drawer-stage-select">
                 {stageOptions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
@@ -2188,18 +2277,6 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
               </div>
             )}
 
-            {!readOnly ? (
-              <Field label="Notes">
-                <Textarea rows={2} value={form.notes} onChange={e => set("notes", e.target.value)}
-                  placeholder="What’s happening on this project?" />
-              </Field>
-            ) : form.notes?.trim() ? (
-              <div className="drawer-posted-notes drawer-posted-notes--inline">
-                <div className="field-label">Notes</div>
-                <div className="notes-rendered"><LinkedText text={form.notes} /></div>
-              </div>
-            ) : null}
-
             {showFollowUps && (
               <BuyerFollowUpSection
                 followUps={form.followUps}
@@ -2223,15 +2300,7 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
               />
             )}
 
-            {!isNew && (
-              <button type="button" className="drawer-extra-toggle" onClick={() => setShowExtra(v => !v)} aria-expanded={showExtra}>
-                {showExtra ? "Hide extra fields" : "Extra fields"}
-                <span className="drawer-extra-hint">{catLabel(form.category)} · {form.season}</span>
-              </button>
-            )}
-
-            {(showExtra || isNew) && (
-              <div className="drawer-extra-panel">
+            <div className="drawer-extra-panel">
                 <div className="drawer-core-grid">
                   <Field label="Category">
                     <Select value={form.category} onChange={e => set("category", e.target.value)} disabled={readOnly}>
@@ -2293,12 +2362,13 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
                   </button>
                 )}
               </div>
-            )}
           </div>
+        </div>
 
-          <div className="drawer-footer drawer-footer--sticky">
-            {!readOnly ? (
-              <div className="drawer-footer-actions">
+        <div className="drawer-footer drawer-footer--bar">
+          {!readOnly ? (
+            <div className="drawer-footer-actions drawer-footer-actions--row">
+              <div className="drawer-footer-main">
                 <button
                   type="button"
                   onClick={handleManualSave}
@@ -2310,28 +2380,28 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
                 {form.title.trim() && (
                   <div className={`drawer-save-status drawer-save-status--${saveState}`} aria-live="polite">
                     {saveState === "saving" ? "Saving…"
-                      : saveState === "pending" ? "Unsaved changes — autosaving…"
-                      : saveState === "error" ? "Save failed — tap Save to retry"
+                      : saveState === "pending" ? "Autosaving…"
+                      : saveState === "error" ? "Save failed — tap Save"
                       : "Saved"}
                   </div>
                 )}
-                {!isNew && (
-                  <div className="drawer-footer-delete-row">
-                    {confirmDelete ? (
-                      <div className="drawer-delete-confirm drawer-delete-confirm--compact">
-                        <button type="button" onClick={() => onDelete(form.id)} className="btn-danger btn-danger--sm">Delete</button>
-                        <button type="button" onClick={() => setConfirmDelete(false)} className="btn-cancel btn-cancel--sm">Cancel</button>
-                      </div>
-                    ) : (
-                      <button type="button" onClick={() => setConfirmDelete(true)} className="btn-ghost-danger btn-ghost-danger--sm">Delete</button>
-                    )}
-                  </div>
-                )}
               </div>
-            ) : (
-              <button type="button" onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
-            )}
-          </div>
+              {!isNew && (
+                <div className="drawer-footer-delete-row">
+                  {confirmDelete ? (
+                    <div className="drawer-delete-confirm drawer-delete-confirm--compact">
+                      <button type="button" onClick={() => onDelete(form.id)} className="btn-danger btn-danger--sm">Delete</button>
+                      <button type="button" onClick={() => setConfirmDelete(false)} className="btn-cancel btn-cancel--sm">Cancel</button>
+                    </div>
+                  ) : (
+                    <button type="button" onClick={() => setConfirmDelete(true)} className="btn-ghost-danger btn-ghost-danger--sm">Delete</button>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <button type="button" onClick={requestClose} className="btn-primary" style={{ width: "100%" }}>Close</button>
+          )}
         </div>
       </div>
     </>
@@ -4047,6 +4117,11 @@ export default function StudioTracker() {
   const productPool = projects.filter(p => p.projectType !== "presentation" && p.stage !== "archived");
   const presPool = projects.filter(p => p.projectType === "presentation" && p.stage !== "archived");
   const activePool = boardMode === "presentations" ? presPool : productPool;
+  const loadTone = (n) => (n <= 0 ? "none" : n <= 2 ? "calm" : n <= 4 ? "busy" : "heavy");
+  const assigneeCounts = Object.fromEntries(
+    TEAM.map(t => [t.name, activePool.filter(p => projectHasAssignee(p, t.name)).length])
+  );
+  const unassignedCount = activePool.filter(isUnassignedProject).length;
   const priorityCount = activePool.filter(hasPriority).length;
   const awaitingSalesCount = productPool.filter(isWaitingOnSalesProduct).length;
   const licensesCount = presPool.filter(isWaitingOnLicenses).length;
@@ -4314,7 +4389,7 @@ export default function StudioTracker() {
         .nick-pop-hint { font-size: 11px; color: #56566A; margin: 10px 0 0; line-height: 1.4; }
         .brand-mark {
           width: 30px; height: 30px;
-          background: linear-gradient(135deg, #8B7FFF, #6055CC);
+          background: linear-gradient(135deg, #5B8A9A, #3D5A66);
           border-radius: 8px; display: flex; align-items: center; justify-content: center;
           font-size: 14px; color: #fff;
         }
@@ -4371,19 +4446,69 @@ export default function StudioTracker() {
         }
         .drawer-action-pair .btn-approve { background: #34D399; }
         .drawer-action-pair .btn-approve:hover { opacity: 0.9; }
-        .btn-new { padding: 8px 16px; background: #8B7FFF; color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; white-space: nowrap; transition: opacity 0.15s; }
+        .btn-new { padding: 8px 16px; background: #5B8A9A; color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; white-space: nowrap; transition: opacity 0.15s; }
         .btn-new:hover { opacity: 0.88; }
         .btn-new:active { transform: scale(0.97); }
         .btn-new--secondary {
-          background: transparent; color: #8B7FFF;
-          border: 1px solid rgba(139,127,255,0.45);
+          background: transparent; color: #5B8A9A;
+          border: 1px solid rgba(91,138,154,0.45);
         }
-        .btn-new--secondary:hover { background: rgba(139,127,255,0.1); opacity: 1; }
+        .btn-new--secondary:hover { background: rgba(91,138,154,0.1); opacity: 1; }
 
         /* ── MAIN ── */
-        .main { padding: 24px 28px 60px; }
+        .main { padding: 18px 28px 60px; }
         .page-title { margin: 0 0 4px; font-size: 28px; font-weight: 700; color: #F0F0F6; }
         .page-sub { margin: 0 0 20px; color: #56566A; font-size: 13px; }
+
+        /* ── BOARD CHROME (compact toolbar) ── */
+        .board-chrome { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+        .board-chrome-row {
+          display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+        }
+        .board-status-summary {
+          display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px 10px;
+          padding: 5px 10px; border-radius: 8px;
+          background: #14141A; border: 1px solid #1E1E28;
+        }
+        .board-status-item {
+          font-size: 12px; font-weight: 500; color: #787890; white-space: nowrap;
+          background: none; border: none; padding: 0; font-family: inherit;
+        }
+        .board-status-item strong {
+          font-weight: 700; color: #C4C4D4; margin-right: 3px;
+        }
+        .board-status-item.is-overdue { color: #F87171; }
+        .board-status-item.is-overdue strong { color: #F87171; }
+        .board-status-item.is-lic {
+          color: #FBBF24; cursor: pointer; border-radius: 4px;
+        }
+        .board-status-item.is-lic strong { color: #FBBF24; }
+        .board-status-item.is-lic:hover { text-decoration: underline; }
+        .board-chrome-search {
+          margin-left: auto; width: min(220px, 100%); min-width: 140px;
+        }
+        .alert-pill {
+          font-size: 11px; font-weight: 700; padding: 5px 10px; border-radius: 100px;
+          border: 1px solid transparent; background: #1C1C24; color: #9494B0;
+          font-family: inherit; cursor: default; white-space: nowrap;
+        }
+        button.alert-pill { cursor: pointer; }
+        button.alert-pill:hover { filter: brightness(1.08); }
+        .alert-pill--overdue {
+          color: #F87171; background: rgba(248,113,113,0.1); border-color: rgba(248,113,113,0.3);
+        }
+        .alert-pill--lic {
+          color: #FBBF24; background: rgba(251,191,36,0.1); border-color: rgba(251,191,36,0.3);
+        }
+        .assign-toggle {
+          padding: 6px 12px; font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
+          background: #14141A; border: 1px solid #2A2A36; border-radius: 8px;
+          color: #787890; cursor: pointer; font-family: inherit; flex-shrink: 0;
+        }
+        .assign-toggle:hover { border-color: #3A3A50; color: #F0F0F6; }
+        .assign-toggle.on {
+          color: #E8F1F4; background: rgba(91,138,154,0.18); border-color: rgba(91,138,154,0.45);
+        }
 
         /* ── STATS ── */
         .stats-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
@@ -4393,19 +4518,60 @@ export default function StudioTracker() {
 
         /* ── FILTER BAR ── */
         .filter-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
-        .filter-section { display: flex; align-items: center; gap: 4px; }
-        .filter-div { width: 1px; height: 22px; background: #2A2A36; margin: 0 4px; }
+        .filter-bar--compact {
+          margin-bottom: 0; gap: 12px;
+          padding: 8px 12px; background: #14141A; border: 1px solid #1E1E28; border-radius: 12px;
+          display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
+        }
+        .filter-bar-start {
+          display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; flex: 1 1 auto;
+        }
+        .filter-bar-end {
+          display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+          margin-left: auto; flex: 0 1 auto; min-width: 0;
+        }
+        .filter-bar--compact .filter-signal-group {
+          background: transparent; border: none; padding: 0; box-shadow: none;
+          justify-content: flex-end;
+        }
+        .filter-bar--compact .filter-group-label { display: none; }
+        .filter-bar--compact .board-focus-wrap {
+          margin: 0; flex: 0 1 auto; max-width: 100%;
+          justify-content: flex-end; gap: 8px;
+        }
+        .filter-section { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+        .filter-div { width: 1px; height: 22px; background: #2A2A36; margin: 0 4px; flex-shrink: 0; }
         .cat-tab { padding: 7px 13px; font-size: 12px; font-weight: 600; background: transparent; border: 1px solid transparent; border-radius: 100px; cursor: pointer; font-family: inherit; color: #56566A; transition: all 0.15s; white-space: nowrap; }
-        .cat-tab:hover { background: #14141A; border-color: #2A2A36; color: #9494B0; }
-        .cat-tab.active { background: #8B7FFF22; color: #8B7FFF; border-color: #8B7FFF44; }
+        .cat-tab:hover { background: #1C1C24; border-color: #2A2A36; color: #9494B0; }
+        .cat-tab.active { background: rgba(91,138,154,0.16); color: #9EC4D0; border-color: rgba(91,138,154,0.4); }
         .tab-ct { opacity: 0.5; font-size: 10px; margin-left: 3px; }
-        .asn-chip { position: relative; cursor: pointer; transition: transform 0.15s; border-radius: 50%; border: 2px solid transparent; }
-        .asn-chip:hover { transform: scale(1.1); }
-        .asn-chip.asn-on { border-color: #8B7FFF; box-shadow: 0 0 0 2px #0C0C10, 0 0 0 4px #8B7FFF; }
-        .asn-chip--unassigned { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; background: #1C1C24; border: 2px dashed #3A3A50; }
-        .asn-chip--unassigned.asn-on { border-style: solid; border-color: #8B7FFF; }
+        .asn-chip {
+          position: relative; cursor: pointer; transition: transform 0.15s;
+          border-radius: 50%; border: 2px solid transparent;
+          background: none; padding: 0; font-family: inherit;
+          display: inline-flex; align-items: center; justify-content: center;
+        }
+        .asn-chip:hover { transform: scale(1.08); }
+        .asn-chip.asn-on { border-color: #5B8A9A; box-shadow: 0 0 0 2px #0C0C10, 0 0 0 4px #5B8A9A; }
+        .asn-chip--unassigned {
+          width: 30px; height: 30px; background: #1C1C24; border: 2px dashed #3A3A50;
+        }
+        .asn-chip--unassigned.asn-on { border-style: solid; border-color: #5B8A9A; }
         .asn-unassigned-mark { font-size: 14px; font-weight: 700; color: #56566A; line-height: 1; }
         .asn-chip--unassigned.asn-on .asn-unassigned-mark { color: #9494B0; }
+        .filter-section--people { gap: 10px; }
+        .asn-load {
+          position: absolute; right: -6px; bottom: -5px;
+          min-width: 16px; height: 16px; padding: 0 4px;
+          border-radius: 100px; border: 2px solid #0C0C10;
+          font-size: 9px; font-weight: 800; line-height: 12px;
+          display: inline-flex; align-items: center; justify-content: center;
+          background: #2A2A36; color: #9494B0;
+        }
+        .asn-load--none { color: #56566A; background: #1C1C24; }
+        .asn-load--calm { color: #34D399; background: #143026; }
+        .asn-load--busy { color: #FBBF24; background: #2A2414; }
+        .asn-load--heavy { color: #F87171; background: #2A1616; }
         .filter-signal-group {
           display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
           background: #14141A; border: 1px solid #1E1E28; border-radius: 10px;
@@ -4449,14 +4615,10 @@ export default function StudioTracker() {
           flex: 0 1 auto; max-width: 100%;
         }
         .focus-filter-status {
-          flex: 0 0 96px;
-          width: 96px;
-          display: flex; align-items: center; justify-content: flex-end;
+          display: none; align-items: center; justify-content: flex-end;
           gap: 6px; font-size: 10px; color: #56566A; white-space: nowrap;
-          opacity: 0; pointer-events: none;
-          transition: opacity 0.15s;
         }
-        .focus-filter-status.is-visible { opacity: 1; pointer-events: auto; }
+        .focus-filter-status.is-visible { display: inline-flex; }
         .focus-filter-count { font-weight: 600; }
         .focus-filter-clear {
           background: none; border: none; padding: 0;
@@ -4506,6 +4668,8 @@ export default function StudioTracker() {
 
         /* ── CAT LEGEND ── */
         .cat-legend { display: flex; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
+        .cat-legend--compact { gap: 10px; margin-bottom: 10px; opacity: 0.75; }
+        .cat-legend--compact .legend-item { font-size: 10px; }
         .legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #9494B0; font-weight: 500; }
         .legend-dot { width: 8px; height: 8px; border-radius: 2px; }
 
@@ -4513,10 +4677,9 @@ export default function StudioTracker() {
         .cat-chip { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; padding: 2px 7px; border-radius: 4px; }
         .cat-chip.sm { font-size: 10px; }
 
-        /* ── BOARD TOOLS (team + focus) ── */
+        /* ── BOARD TOOLS (assign + focus) ── */
         .board-tools-row {
-          display: flex; align-items: center; justify-content: space-between;
-          gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
+          display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; min-height: 0;
         }
         .board-tools-row .team-strip { margin-bottom: 0; }
         .board-tools-focus { margin-left: auto; flex: 0 1 auto; max-width: 100%; }
@@ -4528,7 +4691,11 @@ export default function StudioTracker() {
           display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px 8px;
           width: fit-content; max-width: 100%;
           background: #14141A; border: 1px solid #2A2A36; border-radius: 10px;
-          padding: 6px 10px; margin-bottom: 8px;
+          padding: 5px 8px;
+        }
+        .team-strip--active {
+          border-color: rgba(91,138,154,0.45);
+          background: rgba(91,138,154,0.08);
         }
         .strip-label {
           font-size: 9px; letter-spacing: 0.08em; color: #56566A; text-transform: uppercase;
@@ -4605,17 +4772,21 @@ export default function StudioTracker() {
 
         /* ── COLUMNS ── */
         .col { background: #14141A; border: 1px solid #1E1E28; border-radius: 12px; padding: 10px 12px 10px 10px; transition: background 0.15s, border-color 0.15s; overflow: visible; }
-        .col-on { background: #1C1C28; border-color: #8B7FFF44; box-shadow: inset 0 0 0 1px #8B7FFF44; }
+        .col-on { background: rgba(91,138,154,0.06); border-color: rgba(91,138,154,0.35); box-shadow: none; }
         .col-collapsed { flex: 0 0 auto; min-width: 140px; }
-        .col-head { display: flex; align-items: center; gap: 7px; padding: 5px 6px 10px; cursor: pointer; user-select: none; }
-        .col-collapsed .col-head { padding-bottom: 5px; }
+        .col-head {
+          display: flex; align-items: center; gap: 6px;
+          padding: 4px 4px 8px; cursor: pointer; user-select: none;
+          border-bottom: 1px solid #1A1A22; margin-bottom: 2px;
+        }
+        .col-collapsed .col-head { padding-bottom: 4px; border-bottom: none; margin-bottom: 0; }
         .col-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-        .col-title { font-size: 12px; font-weight: 700; color: #9494B0; white-space: nowrap; letter-spacing: 0.04em; text-transform: uppercase; }
-        .col-count { background: #1E1E28; color: #56566A; padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; flex-shrink: 0; }
-        .col-late { background: rgba(248,113,113,0.12); color: #F87171; border: 1px solid rgba(248,113,113,0.25); border-radius: 10px; padding: 2px 7px; font-size: 10px; font-weight: 700; flex-shrink: 0; }
-        .col-chev { font-size: 16px; color: #3A3A50; flex-shrink: 0; }
+        .col-title { font-size: 11px; font-weight: 700; color: #6E6E82; white-space: nowrap; letter-spacing: 0.05em; text-transform: uppercase; }
+        .col-count { background: transparent; color: #56566A; padding: 0 2px; border-radius: 0; font-size: 11px; font-weight: 600; flex-shrink: 0; }
+        .col-late { background: rgba(248,113,113,0.1); color: #F87171; border: none; border-radius: 6px; padding: 2px 6px; font-size: 10px; font-weight: 700; flex-shrink: 0; }
+        .col-chev { font-size: 14px; color: #3A3A50; flex-shrink: 0; }
         .col-empty { padding: 20px 0; text-align: center; color: #3A3A50; font-size: 12px; border-radius: 8px; transition: all 0.15s; }
-        .col-empty-on { color: #8B7FFF; background: rgba(139,127,255,0.06); border: 1px dashed rgba(139,127,255,0.3); padding: 20px; }
+        .col-empty-on { color: #9EC4D0; background: rgba(91,138,154,0.06); border: 1px dashed rgba(91,138,154,0.3); padding: 20px; }
 
         /* ── CARDS ── */
         .card-view-only { cursor: pointer; }
@@ -4627,7 +4798,7 @@ export default function StudioTracker() {
         .card:active { cursor: grabbing; }
         .card.card-dragging { touch-action: none; }
         .card-dragging { opacity: 0.2; transform: scale(0.97); }
-        .card-drop-target { border-color: #8B7FFF !important; box-shadow: 0 0 0 2px rgba(139,127,255,0.4) !important; }
+        .card-drop-target { border-color: #5B8A9A !important; box-shadow: 0 0 0 2px rgba(91,138,154,0.35) !important; }
         .card-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 7px; }
         .card-flags.compact { margin-bottom: 5px; }
         .card-flag {
@@ -4671,7 +4842,7 @@ export default function StudioTracker() {
           }
         }
         .card-stripe { width: 3px; flex-shrink: 0; background: var(--cc); border-radius: 9px 0 0 9px; }
-        .card-drop-bar { position: absolute; top: 0; left: 0; right: 0; height: 2px; background: #8B7FFF; border-radius: 9px 9px 0 0; pointer-events: none; }
+        .card-drop-bar { position: absolute; top: 0; left: 0; right: 0; height: 2px; background: #5B8A9A; border-radius: 9px 9px 0 0; pointer-events: none; }
         .card-actions {
           position: absolute; top: 7px; right: 7px; z-index: 4;
           display: flex; align-items: center; pointer-events: auto;
@@ -4706,9 +4877,19 @@ export default function StudioTracker() {
         .card-confirm-delete { border-color: rgba(248,113,113,0.45) !important; }
         .card-body { padding: 10px 28px 10px 11px; flex: 1; min-width: 0; }
         .card-view-only .card-body { padding-right: 11px; }
-        .card-title { font-size: 13px; font-weight: 600; color: #F0F0F6; line-height: 1.35; margin-bottom: 5px; }
+        .card-title { font-size: 13px; font-weight: 600; color: #F0F0F6; line-height: 1.35; margin-bottom: 6px; }
         .card-meta { font-size: 11px; color: #56566A; margin-bottom: 4px; }
         .card-status-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+        .card-stage-row { margin-top: 8px; }
+        .card-stage-select {
+          width: 100%; appearance: none; -webkit-appearance: none;
+          background: #14141A url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2356566A' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 8px center;
+          border: 1px solid #2A2A36; border-radius: 7px;
+          color: #C4C4D4; font-size: 11px; font-weight: 600; font-family: inherit;
+          padding: 6px 26px 6px 9px; cursor: pointer; outline: none;
+        }
+        .card-stage-select:hover { border-color: #3A3A50; color: #F0F0F6; }
+        .card-stage-select:focus { border-color: #5B8A9A; }
         .card-meta-flag {
           flex-shrink: 0; font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 4px;
           text-transform: uppercase; letter-spacing: 0.03em; line-height: 1.3;
@@ -4824,7 +5005,7 @@ export default function StudioTracker() {
         /* ── DRAWER ── */
         .drawer-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); z-index: 200; animation: fadeIn 0.18s ease-out; }
         .drawer-overlay.closing { animation: fadeOut 0.18s ease-in forwards; }
-        .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 100%; max-width: 460px; background: #14141A; border-left: 1px solid #2A2A36; z-index: 201; overflow-y: auto; display: flex; flex-direction: column; animation: slideInRight 0.25s ease-out; }
+        .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 100%; max-width: 460px; background: #14141A; border-left: 1px solid #2A2A36; z-index: 201; overflow: hidden; display: flex; flex-direction: column; animation: slideInRight 0.25s ease-out; }
         .drawer.closing { animation: slideOutRight 0.18s ease-in forwards; }
         @keyframes slideInRight { from { transform: translateX(100%); } to { transform: translateX(0); } }
         @keyframes slideOutRight { from { transform: translateX(0); } to { transform: translateX(100%); } }
@@ -4929,14 +5110,15 @@ export default function StudioTracker() {
         .drawer .activity-log { margin-top: 0; margin-bottom: 0; padding-top: 0; border-top: none; }
         .drawer .fu-section { border-top: none; padding-top: 0; margin-top: 0; }
         .drawer .drawer-move-board { min-height: 38px; padding: 10px 14px; font-size: 12px; }
-        .drawer--simple .drawer-inner { padding-bottom: 80px; }
-        .drawer--focus .drawer-inner { padding: 16px 18px 88px; }
+        .drawer--simple .drawer-inner { padding-bottom: 28px; }
+        .drawer--focus .drawer-inner { padding: 16px 18px 20px; min-height: 0; }
         .drawer-head--focus { margin-bottom: 4px; }
         .drawer-focus-eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #56566A; }
         .drawer-title--focus { font-size: 22px; margin-bottom: 16px; padding-bottom: 0; border-bottom: none; }
         .drawer-focus-body { display: flex; flex-direction: column; gap: 12px; }
         .drawer--focus .field-label { text-transform: none; letter-spacing: 0; font-size: 12px; color: #787890; font-weight: 600; }
         .drawer-stage-select { min-height: 40px; font-size: 14px; font-weight: 600; }
+        .drawer-notes-input { min-height: 152px; resize: none; overflow: hidden; box-sizing: border-box; }
         .drawer-flag-row { display: flex; flex-wrap: wrap; gap: 6px; }
         .drawer-flag-row .blocker-pill { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
         .drawer-flag-row .blocker-pill.sales.on {
@@ -4948,15 +5130,9 @@ export default function StudioTracker() {
           background: rgba(139,127,255,0.1);
         }
         .drawer-flag-row .blocker-pill:hover:not(:disabled):not(.on) { border-color: #3A3A50; color: #C4C4D4; }
-        .drawer-extra-toggle {
-          width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px;
-          padding: 10px 0; margin-top: 4px; background: none; border: none; border-top: 1px solid #2A2A36;
-          cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600; color: #8B7FFF;
-        }
-        .drawer-extra-hint { font-size: 11px; font-weight: 600; color: #56566A; }
         .drawer-extra-panel {
           display: flex; flex-direction: column; gap: 10px;
-          padding: 12px 0 4px; border-top: 1px solid #2A2A36;
+          padding: 4px 0;
         }
         .drawer-action-panel { display: flex; flex-direction: column; gap: 8px; }
         .drawer-action-panel-label { font-size: 11px; font-weight: 700; color: #34D399; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -4989,13 +5165,34 @@ export default function StudioTracker() {
           background: linear-gradient(to top, #14141A 70%, transparent);
           margin-top: 8px; padding-top: 12px; padding-bottom: 4px;
         }
+        .drawer-footer--bar {
+          flex-shrink: 0;
+          border-top: 1px solid #2A2A36;
+          background: #14141A;
+          padding: 12px 18px max(14px, env(safe-area-inset-bottom));
+          margin: 0;
+        }
         .drawer-footer--sticky .drawer-actions-row { grid-template-columns: 1fr; }
         .drawer-footer-actions { display: flex; flex-direction: column; gap: 6px; width: 100%; }
-        .drawer-save-status { font-size: 11px; font-weight: 600; text-align: center; padding: 2px 0 0; color: #56566A; }
+        .drawer-footer-actions--row {
+          flex-direction: row;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .drawer-footer-main {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+          flex: 1;
+          min-width: 0;
+        }
+        .drawer-footer-main .btn-primary { width: 100%; }
+        .drawer-save-status { font-size: 11px; font-weight: 600; text-align: left; padding: 0; color: #56566A; }
         .drawer-save-status--saved { color: #34D399; }
         .drawer-save-status--error { color: #F87171; }
         .drawer-save-status--saving, .drawer-save-status--pending { color: #9494B0; }
-        .drawer-footer-delete-row { display: flex; justify-content: flex-end; min-height: 28px; }
+        .drawer-footer-delete-row { display: flex; justify-content: flex-end; align-items: center; flex-shrink: 0; min-height: 28px; }
         .drawer-delete-confirm--compact { display: flex; gap: 6px; justify-content: flex-end; }
         .btn-ghost-danger--sm, .btn-danger--sm, .btn-cancel--sm {
           min-height: 0; padding: 5px 10px; font-size: 11px; font-weight: 600; border-radius: 6px;
@@ -5488,12 +5685,25 @@ export default function StudioTracker() {
         @keyframes ti { from { opacity:0; transform:translate(-50%,6px); } to { opacity:1; transform:translate(-50%,0); } }
 
         /* ── MOBILE ── */
+        @media (max-width: 1100px) {
+          .board-chrome-search { width: min(180px, 100%); }
+          .filter-bar--compact { align-items: flex-start; }
+          .filter-bar-end { width: 100%; margin-left: 0; justify-content: flex-end; padding-top: 2px; }
+          .col { flex: 0 0 calc(33.333% - 8px); min-width: 220px; }
+        }
         @media (max-width: 900px) {
           .header { flex-wrap: wrap; height: auto; padding-top: 10px; padding-bottom: 10px; row-gap: 10px; }
           .nav-center { position: static; transform: none; order: 2; width: 100%; }
           .header-right { order: 3; width: 100%; justify-content: flex-end; }
+          .board {
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-gutter: stable;
+            padding-bottom: 16px;
+          }
+          .col { flex: 0 0 260px; min-width: 260px; }
         }
-
         @media (max-width: 1000px) {
           .sales-split { grid-template-columns: 1fr; min-height: 0; }
           .sales-req-board { flex-wrap: wrap; }
@@ -5504,12 +5714,21 @@ export default function StudioTracker() {
           .brand-tag { display: none; }
           .nav-center { position: static; transform: none; order: 2; width: 100%; margin-top: 0; }
           .main { padding: 16px 16px 80px; }
+          .board-chrome-row { gap: 8px; }
+          .board-status-summary { order: 3; flex: 1 1 auto; }
+          .board-chrome-search { margin-left: 0; width: 100%; min-width: 0; flex: 1 1 100%; order: 5; }
+          .filter-bar--compact { padding: 8px; flex-direction: column; align-items: stretch; gap: 10px; }
+          .filter-bar-start { width: 100%; }
+          .filter-bar-end { width: 100%; margin-left: 0; justify-content: flex-start; }
+          .filter-bar--compact .board-focus-wrap,
+          .filter-bar--compact .filter-signal-group { justify-content: flex-start; width: 100%; }
+          .filter-div { display: none; }
           .stats-bar { gap: 8px; }
           .stat { padding: 10px 14px; min-width: 0; flex: 1; }
           .stat-val { font-size: 20px; }
           .filter-bar { gap: 8px; }
-          .filter-signal-group { width: 100%; flex-direction: column; align-items: flex-start; gap: 8px; padding: 10px 12px; }
-          .signal-chip-row { width: 100%; }
+          .filter-signal-group { width: 100%; flex-direction: row; align-items: center; gap: 8px; padding: 0; }
+          .signal-chip-row { width: auto; flex: 1; }
           .ss-topbar-actions { width: 100%; margin-left: 0; }
           .ss-topbar .ss-search { width: 100%; flex: 1; min-width: 0; }
           .board-tools-row { flex-direction: column; align-items: stretch; }
@@ -5525,7 +5744,7 @@ export default function StudioTracker() {
             scrollbar-gutter: stable;
           }
           .col { padding: 10px 12px; }
-          .col { flex: 0 0 252px; }
+          .col { flex: 0 0 252px; min-width: 252px; }
           .list-row { grid-template-columns: 3px 1fr auto; grid-template-rows: auto auto; }
           .list-main { grid-column: 2; grid-row: 1; }
           .list-stage-pill { grid-column: 3; grid-row: 1; align-self: center; }
@@ -5535,7 +5754,8 @@ export default function StudioTracker() {
           .drawer.closing { animation: slideOutDown 0.18s ease-in forwards; }
           @keyframes slideOutDown { from { transform: translateY(0); } to { transform: translateY(100%); } }
           .drawer-handle { display: flex; width: 36px; height: 4px; background: #2A2A36; border-radius: 2px; margin: 10px auto 0; }
-          .drawer-inner { padding: 16px 20px max(28px, env(safe-area-inset-bottom)); }
+          .drawer-inner { padding: 16px 20px 20px; }
+          .drawer-footer--bar { padding: 12px 20px max(14px, env(safe-area-inset-bottom)); }
           .drawer-title { font-size: 18px; }
           .field-grid { grid-template-columns: 1fr; gap: 12px; }
           .drawer .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -5555,10 +5775,9 @@ export default function StudioTracker() {
         <div className="brand">
           <div className="brand-mark">◈</div>
           <span className="brand-name">Studio</span>
-          <span className={`sync-pill ${window.storage?.mode === "shared" ? "" : "local"}`}>
-            {window.storage?.mode === "shared" ? "Team board" : "This device only"}
-          </span>
-          {isMaster && <span className="sync-pill" style={{ borderColor: "rgba(139,127,255,0.35)", color: "#8B7FFF" }}>Master</span>}
+          {window.storage?.mode !== "shared" && (
+            <span className="sync-pill local">This device only</span>
+          )}
           {isViewer && <span className="sync-pill viewer">View only</span>}
           {isLoaded && user?.id && (
             <HeaderNickname userId={user.id} colorName={boardProfile} />
@@ -5581,9 +5800,7 @@ export default function StudioTracker() {
               Sales
               {canReviewSalesRequests && salesPendingCount > 0 ? (
                 <span className="nav-badge" title="Pending sales requests">{salesPendingCount}</span>
-              ) : (
-                <span className="nav-badge" style={{ background: "rgba(139,127,255,0.15)", borderColor: "rgba(139,127,255,0.35)", color: "#8B7FFF" }}>Beta</span>
-              )}
+              ) : null}
             </button>
           </div>
         </div>
@@ -5650,64 +5867,79 @@ export default function StudioTracker() {
         </main>
       ) : (
       <main className="main">
-        <div className="ss-topbar">
-          <div>
-            <h1 className="page-title">{boardMode === "presentations" ? "Presentations" : "Projects"}</h1>
-            <p className="page-sub">{activeCount} {boardMode === "presentations" ? "presentations" : "products"} · drag to move or reassign</p>
+        <div className="board-chrome">
+          <div className="board-chrome-row">
+            <div className="bm-toggle">
+              <button onClick={() => { setBoardMode("products"); setBoardTagFilter(null); }} className={`bm-btn ${boardMode === "products" ? "active" : ""}`}>Products</button>
+              <button onClick={() => { setBoardMode("presentations"); setBoardTagFilter(null); }} className={`bm-btn ${boardMode === "presentations" ? "active pres" : ""}`}>Presentations</button>
+            </div>
+            <div className="board-status-summary" aria-label="Board summary">
+              <span className="board-status-item">
+                <strong>{activeCount}</strong>
+                {boardMode === "presentations" ? " presentations" : " products"}
+              </span>
+              {overdueCount > 0 && (
+                <span className="board-status-item is-overdue" title="Past due date">
+                  <strong>{overdueCount}</strong> overdue
+                </span>
+              )}
+              {licOpenCount > 0 && (
+                <button
+                  type="button"
+                  className="board-status-item is-lic"
+                  onClick={() => setPage("licensing")}
+                  title="Open licensing requests"
+                >
+                  <strong>{licOpenCount}</strong> licensing open
+                </button>
+              )}
+            </div>
+            <input
+              className="ss-search board-chrome-search"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search…"
+            />
           </div>
-          <input
-            className="ss-search"
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            placeholder="Search projects…"
-          />
-        </div>
 
-        {/* Stats */}
-        <div className="stats-bar">
-          <div className="stat">
-            <div><div className="stat-val">{activeCount}</div><div className="stat-label">Active</div></div>
-          </div>
-          {licOpenCount > 0 && (
-            <div className="stat" style={{ borderColor: "rgba(251,191,36,0.25)", cursor:"pointer" }} onClick={() => setPage("licensing")}>
-              <div><div className="stat-val" style={{ color: C.amber }}>{licOpenCount}</div><div className="stat-label">Licensing open</div></div>
-            </div>
-          )}
-          <div className="stat" style={{ borderColor: "rgba(52,211,153,0.25)" }}>
-            <div><div className="stat-val" style={{ color: C.green }}>{prodCount}</div><div className="stat-label">Prod Ready</div></div>
-          </div>
-          {presCountGlobal > 0 && (
-            <div className="stat" style={{ borderColor:"rgba(139,127,255,0.25)", cursor:"pointer" }} onClick={() => setBoardMode(m => m === "presentations" ? "products" : "presentations")}>
-              <div><div className="stat-val" style={{ color:"#8B7FFF" }}>{presCountGlobal}</div><div className="stat-label">Presentations</div></div>
-            </div>
-          )}
-          {overdueCount > 0 && (
-            <div className="stat" style={{ borderColor: "rgba(248,113,113,0.25)" }}>
-              <div><div className="stat-val" style={{ color: C.red }}>{overdueCount}</div><div className="stat-label">Overdue</div></div>
-            </div>
-          )}
-          <HeatmapCard projects={projects} />
-        </div>
-
-        {/* Filters */}
-        <div className="filter-bar">
-          {/* Board mode toggle */}
-          <div className="bm-toggle">
-            <button onClick={() => { setBoardMode("products"); setBoardTagFilter(null); }} className={`bm-btn ${boardMode === "products" ? "active" : ""}`}>Products</button>
-            <button onClick={() => { setBoardMode("presentations"); setBoardTagFilter(null); }} className={`bm-btn ${boardMode === "presentations" ? "active pres" : ""}`}>Presentations</button>
-          </div>
-          <div className="filter-div" />
-          {/* Category filter */}
-          <div className="filter-section">
-            {CATEGORIES.map(c => (
-              <button key={c.id} onClick={() => setCategoryFilter(c.id)} className={`cat-tab ${categoryFilter === c.id ? "active" : ""}`}>
-                {c.label}<span className="tab-ct">{catCounts[c.id]}</span>
-              </button>
-            ))}
-          </div>
-          {view !== "board" && (
-            <>
+          <div className="filter-bar filter-bar--compact">
+            <div className="filter-bar-start">
+              <div className="filter-section">
+                {CATEGORIES.map(c => (
+                  <button key={c.id} onClick={() => setCategoryFilter(c.id)} className={`cat-tab ${categoryFilter === c.id ? "active" : ""}`}>
+                    {c.label}<span className="tab-ct">{catCounts[c.id]}</span>
+                  </button>
+                ))}
+              </div>
               <div className="filter-div" />
+              <div className="filter-section filter-section--people" aria-label="Filter by teammate">
+                {TEAM.map(t => {
+                  const n = assigneeCounts[t.name] || 0;
+                  return (
+                    <button
+                      key={t.name}
+                      type="button"
+                      title={`${t.name} · ${n} active ${boardMode === "presentations" ? "presentation" : "project"}${n !== 1 ? "s" : ""}`}
+                      className={`asn-chip ${assigneeFilter === t.name ? "asn-on" : ""}`}
+                      onClick={() => setAssigneeFilter(f => f === t.name ? null : t.name)}
+                    >
+                      <span className="av av-md" style={{ background: t.color }}>{initials(t.name)}</span>
+                      <span className={`asn-load asn-load--${loadTone(n)}`}>{n}</span>
+                    </button>
+                  );
+                })}
+                <button
+                  type="button"
+                  title={`Unassigned · ${unassignedCount} active`}
+                  className={`asn-chip asn-chip--unassigned ${assigneeFilter === UNASSIGNED_FILTER ? "asn-on" : ""}`}
+                  onClick={() => setAssigneeFilter(f => f === UNASSIGNED_FILTER ? null : UNASSIGNED_FILTER)}
+                >
+                  <span className="asn-unassigned-mark" aria-hidden>—</span>
+                  <span className={`asn-load asn-load--${loadTone(unassignedCount)}`}>{unassignedCount}</span>
+                </button>
+              </div>
+            </div>
+            <div className="filter-bar-end">
               <FocusFilterBar
                 boardMode={boardMode}
                 boardTagFilter={boardTagFilter}
@@ -5718,23 +5950,8 @@ export default function StudioTracker() {
                 presSalesInfoCount={presSalesInfoCount}
                 presBlockedCount={presBlockedCount}
                 filteredShownCount={activeCount}
+                statusAside
               />
-            </>
-          )}
-          <div className="filter-div" />
-          <div className="filter-section" style={{ gap: 6 }}>
-            {TEAM.map(t => (
-              <div key={t.name} title={t.name} className={`asn-chip ${assigneeFilter === t.name ? "asn-on" : ""}`}
-                onClick={() => setAssigneeFilter(f => f === t.name ? null : t.name)}>
-                <span className="av av-md" style={{ background: t.color }}>{initials(t.name)}</span>
-              </div>
-            ))}
-            <div
-              title="Unassigned"
-              className={`asn-chip asn-chip--unassigned ${assigneeFilter === UNASSIGNED_FILTER ? "asn-on" : ""}`}
-              onClick={() => setAssigneeFilter(f => f === UNASSIGNED_FILTER ? null : UNASSIGNED_FILTER)}
-            >
-              <span className="asn-unassigned-mark" aria-hidden>—</span>
             </div>
           </div>
         </div>
@@ -5750,20 +5967,6 @@ export default function StudioTracker() {
             stages={activeStages}
             canEdit={canEditProjects}
             shouldGlowProject={shouldGlowProject}
-            focusBar={
-              <FocusFilterBar
-                boardMode={boardMode}
-                boardTagFilter={boardTagFilter}
-                setBoardTagFilter={setBoardTagFilter}
-                priorityCount={priorityCount}
-                awaitingSalesCount={awaitingSalesCount}
-                licensesCount={licensesCount}
-                presSalesInfoCount={presSalesInfoCount}
-                presBlockedCount={presBlockedCount}
-                filteredShownCount={activeCount}
-                statusAside
-              />
-            }
           />
         ) : view === "list" ? (
           <ListView projects={filtered.filter(p => p.stage !== "archived")} onOpen={openProject} shouldGlowProject={shouldGlowProject} />
