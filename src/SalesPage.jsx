@@ -40,6 +40,15 @@ function daysUntil(dateStr) {
   return Math.round((d - t) / 86400000);
 }
 
+/** Past due no longer counts once sent / done */
+const OVERDUE_EXEMPT_STAGES = new Set(["sent", "picks_in", "prod_ready", "archived"]);
+
+function isOverdueProject(p) {
+  if (!p || OVERDUE_EXEMPT_STAGES.has(p.stage)) return false;
+  const d = daysUntil(p.dueDate);
+  return d !== null && d < 0;
+}
+
 function projectAssigneeNames(p) {
   if (Array.isArray(p.assignees) && p.assignees.length) return [...new Set(p.assignees.filter(Boolean))];
   if (p.assignee) return [p.assignee];
@@ -79,16 +88,16 @@ export function computeOverview(projects) {
     else byPriority.none += 1;
     const d = daysUntil(p.dueDate);
     if (d === null) due.noDate += 1;
-    else if (d < 0) due.overdue += 1;
+    else if (isOverdueProject(p)) due.overdue += 1;
+    else if (d < 0) { /* Sent / done — past due ignored */ }
     else if (d <= 7) due.thisWeek += 1;
     else if (d <= 14) due.next14 += 1;
     else due.later += 1;
   });
 
   const isAtRisk = (p) => {
-    const d = daysUntil(p.dueDate);
     return (
-      (d !== null && d < 0) ||
+      isOverdueProject(p) ||
       p.priority === "urgent" ||
       p.priority === "high" ||
       p.waitingOnSales ||
