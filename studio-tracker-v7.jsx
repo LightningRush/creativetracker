@@ -384,6 +384,15 @@ const daysUntil = (d) => {
   return Math.round((due - today) / 86400000);
 };
 
+/** Stages where a past due date is no longer "overdue" (already shipped / done) */
+const OVERDUE_EXEMPT_STAGES = new Set(["sent", "picks_in", "prod_ready", "archived"]);
+
+function isOverdueProject(p) {
+  if (!p || OVERDUE_EXEMPT_STAGES.has(p.stage)) return false;
+  const days = daysUntil(p.dueDate);
+  return days !== null && days < 0;
+}
+
 const stopCardClick = (e) => e.stopPropagation();
 
 const normalizeStyleEntries = (v) => {
@@ -1268,8 +1277,8 @@ function BoardCard({
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const days    = daysUntil(project.dueDate);
-  const overdue = days !== null && days < 0;
-  const dueSoon = days !== null && days >= 0 && days <= 14;
+  const overdue = isOverdueProject(project);
+  const dueSoon = !overdue && days !== null && days >= 0 && days <= 14;
   const cc      = catColor(project.category);
   const pr       = priorityOf(project);
   const licenses = isWaitingOnLicenses(project);
@@ -1600,7 +1609,7 @@ function Board({ projects, onAssign, onReorder, onOpen, onQuickAdd, onDelete, st
             projects,
           );
           const isHov    = isDC && hover?.type === "stage" && hover.value === stage.id;
-          const overdueCt = items.filter(p => { const d = daysUntil(p.dueDate); return d !== null && d < 0; }).length;
+          const overdueCt = items.filter(isOverdueProject).length;
           const isColl   = collapsed.has(stage.id);
           const bodyScroll = !isColl && items.length >= COL_SCROLL_CARD_THRESHOLD;
           return (
@@ -1675,7 +1684,7 @@ function ListView({ projects, onOpen, shouldGlowProject }) {
         : projects.map(p => {
           const stage = stageOf(p.stage);
           const days = daysUntil(p.dueDate);
-          const overdue = days !== null && days < 0;
+          const overdue = isOverdueProject(p);
           const cc = catColor(p.category);
           const isNew = shouldGlowProject?.(p) ?? false;
           return (
@@ -4113,7 +4122,7 @@ export default function StudioTracker() {
   const presCountGlobal = presentationProjects.filter(p => p.stage !== "archived").length;
   const presCount     = boardMode === "presentations" ? activeCount : presCountGlobal;
   const prodCount     = filtered.filter(p => p.stage === "prod_ready").length;
-  const overdueCount  = visibleNonArchived.filter(p => { const d = daysUntil(p.dueDate); return d !== null && d < 0; }).length;
+  const overdueCount  = visibleNonArchived.filter(isOverdueProject).length;
   const productPool = projects.filter(p => p.projectType !== "presentation" && p.stage !== "archived");
   const presPool = projects.filter(p => p.projectType === "presentation" && p.stage !== "archived");
   const activePool = boardMode === "presentations" ? presPool : productPool;
@@ -5879,7 +5888,7 @@ export default function StudioTracker() {
                 {boardMode === "presentations" ? " presentations" : " products"}
               </span>
               {overdueCount > 0 && (
-                <span className="board-status-item is-overdue" title="Past due date">
+                <span className="board-status-item is-overdue" title="Past due and still in progress">
                   <strong>{overdueCount}</strong> overdue
                 </span>
               )}
