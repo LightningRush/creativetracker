@@ -58,33 +58,55 @@ function isFresher(candidate, baseline) {
   return a.len > b.len;
 }
 
-/** Per-project merge — newer updatedAt wins; keeps creates from either side */
-function mergeProjectLists(local, remote) {
-  if (!Array.isArray(remote)) return Array.isArray(local) ? local : [];
-  if (!Array.isArray(local) || !local.length) return remote;
+/** Concurrent creates from another tab still in flight (ms) */
+const REMOTE_CREATE_GRACE_MS = 90000;
 
-  const byId = new Map();
+/**
+ * Write-path merge: local board is authoritative for membership + order.
+ * Remote-only IDs are NOT kept (that resurrected deletes). Only very fresh
+ * remote-only cards are pulled in (concurrent create from another client).
+ * For shared IDs, newer content wins but local stage/boardOrder always stick
+ * — this write is an intentional board mutation.
+ */
+function mergeProjectLists(local, remote) {
+  if (!Array.isArray(local)) return Array.isArray(remote) ? remote : [];
+  if (!Array.isArray(remote) || !remote.length) return local;
+
+  const remoteById = new Map();
   for (const p of remote) {
-    if (p?.id) byId.set(p.id, p);
+    if (p?.id) remoteById.set(p.id, p);
   }
+
+  const localIds = new Set();
+  const merged = [];
+
   for (const p of local) {
     if (!p?.id) continue;
-    const r = byId.get(p.id);
-    if (!r || projectTime(p) >= projectTime(r)) byId.set(p.id, p);
+    localIds.add(p.id);
+    const r = remoteById.get(p.id);
+    if (!r) {
+      merged.push(p);
+      continue;
+    }
+    if (projectTime(p) >= projectTime(r)) {
+      merged.push(p);
+    } else {
+      // Remote has newer field edits; keep this client's column placement
+      merged.push({
+        ...r,
+        stage: p.stage,
+        boardOrder: p.boardOrder,
+      });
+    }
   }
 
-  const used = new Set();
-  const merged = [];
-  for (const p of remote) {
-    if (!p?.id || used.has(p.id)) continue;
-    merged.push(byId.get(p.id) || p);
-    used.add(p.id);
+  const now = Date.now();
+  for (const r of remote) {
+    if (!r?.id || localIds.has(r.id)) continue;
+    const t = projectTime(r);
+    if (t && now - t < REMOTE_CREATE_GRACE_MS) merged.push(r);
   }
-  for (const p of local) {
-    if (!p?.id || used.has(p.id)) continue;
-    merged.push(byId.get(p.id) || p);
-    used.add(p.id);
-  }
+
   return merged;
 }
 
