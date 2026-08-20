@@ -85,13 +85,16 @@ function orderProjectsForBoard(stageItems, allProjects) {
 }
 
 /** Re-number boardOrder for stages based on current global array order */
-function applyBoardOrderForStages(projects, stageIds) {
+function applyBoardOrderForStages(projects, stageIds, stampIso) {
   const counters = {};
+  const at = stampIso || new Date().toISOString();
   return projects.map(p => {
     if (!stageIds.has(p.stage)) return p;
     const n = counters[p.stage] ?? 0;
     counters[p.stage] = n + 1;
-    return { ...p, boardOrder: n };
+    if (p.boardOrder === n) return p;
+    // Bump updatedAt so sync merges prefer this client's order
+    return { ...p, boardOrder: n, updatedAt: at };
   });
 }
 
@@ -211,46 +214,52 @@ function projectSyncTime(p) {
 }
 
 /**
- * Merge local + remote boards so a stale cloud snapshot can't wipe
- * a move/create that already happened on this client.
+ * Merge local + remote boards.
+ * Local membership/order win so in-flight deletes and reorders aren't undone by
+ * a stale cloud snapshot. Remote-only IDs are still accepted (other users' creates).
+ * Deletes stick because the write path no longer re-adds remote-only cards.
  */
 function mergeProjectsBoard(local, remote) {
   if (!Array.isArray(remote)) return { merged: Array.isArray(local) ? local : [], localWins: false };
   if (!Array.isArray(local) || !local.length) return { merged: remote, localWins: false };
 
-  const byId = new Map();
-  let localWins = false;
-
+  const remoteById = new Map();
   for (const p of remote) {
-    if (p?.id) byId.set(p.id, p);
+    if (p?.id) remoteById.set(p.id, p);
   }
+
+  let localWins = false;
+  const localIds = new Set();
+  const merged = [];
 
   for (const p of local) {
     if (!p?.id) continue;
-    const r = byId.get(p.id);
+    localIds.add(p.id);
+    const r = remoteById.get(p.id);
     if (!r) {
-      byId.set(p.id, p);
+      merged.push(p);
       localWins = true;
       continue;
     }
-    if (projectSyncTime(p) > projectSyncTime(r)) {
-      byId.set(p.id, p);
+    const lt = projectSyncTime(p);
+    const rt = projectSyncTime(r);
+    if (lt > rt) {
+      merged.push(p);
       localWins = true;
+    } else if (lt < rt) {
+      merged.push(r);
+    } else {
+      // Equal time: prefer local (same-stage reorder often doesn't change activity)
+      merged.push(p);
+      if (p.stage !== r.stage || p.boardOrder !== r.boardOrder) localWins = true;
     }
   }
 
-  const used = new Set();
-  const merged = [];
-  for (const p of remote) {
-    if (!p?.id || used.has(p.id)) continue;
-    merged.push(byId.get(p.id) || p);
-    used.add(p.id);
+  for (const r of remote) {
+    if (!r?.id || localIds.has(r.id)) continue;
+    merged.push(r);
   }
-  for (const p of local) {
-    if (!p?.id || used.has(p.id)) continue;
-    merged.push(byId.get(p.id) || p);
-    used.add(p.id);
-  }
+
   return { merged, localWins };
 }
 
@@ -3581,6 +3590,8 @@ export default function StudioTracker() {
   const saveFailProtectUntilRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
   const saveProjectsRef = useRef(null);
+  /** IDs removed locally until cloud confirms they're gone (blocks stale remote resurrect) */
+  const suppressedRemoteIdsRef = useRef(new Set());
   const [sets,           setSets]           = useState([]);
   const [licRequests,    setLicRequests]    = useState([]);
   const [salesRequests,  setSalesRequests]  = useState([]);
@@ -3759,10 +3770,15 @@ export default function StudioTracker() {
           data = data.map(normalizeProjectForSave);
           setProjects(prev => {
             const { merged } = mergeProjectsBoard(prev, data);
-            const next = mergeProjectHighlights(merged, prev);
+            const remoteIds = new Set(data.map(p => p?.id).filter(Boolean));
+            // Drop IDs we deleted locally until cloud no longer has them
+            for (const id of [...suppressedRemoteIdsRef.current]) {
+              if (!remoteIds.has(id)) suppressedRemoteIdsRef.current.delete(id);
+            }
+            const filtered = merged.filter(p => !suppressedRemoteIdsRef.current.has(p?.id));
+            const next = mergeProjectHighlights(filtered, prev);
             projectsRef.current = next;
             // Only re-push if this client created cards the cloud doesn't have yet
-            const remoteIds = new Set(data.map(p => p?.id).filter(Boolean));
             const hasLocalCreates = prev.some(p => p?.id && !remoteIds.has(p.id));
             if (hasLocalCreates && Date.now() - lastLocalSaveAtRef.current < 60000) {
               queueMicrotask(() => saveProjectsRef.current?.(next));
@@ -3802,9 +3818,13 @@ export default function StudioTracker() {
         setProjects(prev => {
           const remote = Array.isArray(p) ? p : [];
           const { merged } = mergeProjectsBoard(prev, remote);
-          const next = mergeProjectHighlights(merged, prev);
-          projectsRef.current = next;
           const remoteIds = new Set(remote.map(x => x?.id).filter(Boolean));
+          for (const id of [...suppressedRemoteIdsRef.current]) {
+            if (!remoteIds.has(id)) suppressedRemoteIdsRef.current.delete(id);
+          }
+          const filtered = merged.filter(x => !suppressedRemoteIdsRef.current.has(x?.id));
+          const next = mergeProjectHighlights(filtered, prev);
+          projectsRef.current = next;
           const hasLocalCreates = prev.some(x => x?.id && !remoteIds.has(x.id));
           if (hasLocalCreates) queueMicrotask(() => saveProjectsRef.current?.(next));
           return next;
@@ -3833,11 +3853,21 @@ export default function StudioTracker() {
   const saveProjects = useCallback((next, opts) => {
     const message = typeof opts === "string" ? opts : opts?.message;
     const undoSnapshot = typeof opts === "object" && opts?.undoSnapshot != null ? opts.undoSnapshot : null;
+    const prevIds = new Set((projectsRef.current || []).map(p => p?.id).filter(Boolean));
+    const nextIds = new Set((next || []).map(p => p?.id).filter(Boolean));
+    for (const id of prevIds) {
+      if (!nextIds.has(id)) suppressedRemoteIdsRef.current.add(id);
+    }
+    for (const id of nextIds) {
+      suppressedRemoteIdsRef.current.delete(id);
+    }
     projectsRef.current = next;
     setProjects(next);
+    // Block remote apply immediately — not only after the queued save starts —
+    // so a poll can't resurrect a just-deleted card before the write begins.
+    savingRef.current += 1;
 
     const run = async () => {
-      savingRef.current += 1;
       let attempt = 0;
       try {
         while (true) {
@@ -3896,13 +3926,18 @@ export default function StudioTracker() {
     const proj = list.find(p => p.id === id);
     if (!proj) return;
     const prevStage = proj.stage;
+    const now = new Date().toISOString();
     let next = list.filter(p => p.id !== id);
-    const updated = withActivity(proj, { ...proj, stage: newStage }, actor);
+    let updated = withActivity(proj, { ...proj, stage: newStage }, actor);
+    // Same-stage reorder may not create activity — still stamp so sync keeps order
+    if (!updated.updatedAt || updated.updatedAt === proj.updatedAt) {
+      updated = { ...updated, updatedAt: now };
+    }
     if (beforeId) { const i = next.findIndex(p => p.id === beforeId); next.splice(i >= 0 ? i : next.length, 0, updated); }
     else { const idxs = next.map((p, i) => p.stage === newStage ? i : -1).filter(i => i >= 0); next.splice(idxs.length ? idxs[idxs.length - 1] + 1 : next.length, 0, updated); }
     const stagesToRenumber = new Set([newStage]);
     if (prevStage !== newStage) stagesToRenumber.add(prevStage);
-    next = applyBoardOrderForStages(next, stagesToRenumber);
+    next = applyBoardOrderForStages(next, stagesToRenumber, now);
     const msg = proj.stage !== newStage ? `Moved to ${stageOf(newStage).label}` : "Reordered";
     saveProjects(next, { message: msg, undoSnapshot: list });
   }, [saveProjects, actor, canEditProjects]);
