@@ -215,11 +215,62 @@ function projectSyncTime(p) {
   );
 }
 
+/** How long a brand-new card can exist on only one client before sync treats it as intentional */
+const MEMBERSHIP_GRACE_MS = 90000;
+const DELETED_IDS_KEY = "st_v10_deleted_ids";
+
+function loadDeletedIds() {
+  try {
+    const raw = localStorage.getItem(DELETED_IDS_KEY);
+    const obj = raw ? JSON.parse(raw) : {};
+    return obj && typeof obj === "object" ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveDeletedIds(map) {
+  try {
+    localStorage.setItem(DELETED_IDS_KEY, JSON.stringify(map));
+  } catch {
+    /* ignore */
+  }
+}
+
+function rememberDeletedIds(ids) {
+  if (!ids?.length) return;
+  const map = loadDeletedIds();
+  const now = new Date().toISOString();
+  for (const id of ids) {
+    if (id) map[id] = now;
+  }
+  // Drop tombstones older than 30 days
+  const cutoff = Date.now() - 30 * 86400000;
+  for (const [id, at] of Object.entries(map)) {
+    const t = Date.parse(at) || 0;
+    if (t && t < cutoff) delete map[id];
+  }
+  saveDeletedIds(map);
+}
+
+function clearDeletedIds(ids) {
+  if (!ids?.length) return;
+  const map = loadDeletedIds();
+  let changed = false;
+  for (const id of ids) {
+    if (id && map[id]) {
+      delete map[id];
+      changed = true;
+    }
+  }
+  if (changed) saveDeletedIds(map);
+}
+
 /**
  * Merge local + remote boards.
- * Local membership/order win so in-flight deletes and reorders aren't undone by
- * a stale cloud snapshot. Remote-only IDs are still accepted (other users' creates).
- * Deletes stick because the write path no longer re-adds remote-only cards.
+ * Membership is symmetric: an ID only on one side is kept only if fresh
+ * (concurrent create). Stale local-only cards are dropped so a delete on
+ * another tab/device actually sticks instead of being re-saved forever.
  */
 function mergeProjectsBoard(local, remote) {
   if (!Array.isArray(remote)) return { merged: Array.isArray(local) ? local : [], localWins: false };
@@ -233,14 +284,27 @@ function mergeProjectsBoard(local, remote) {
   let localWins = false;
   const localIds = new Set();
   const merged = [];
+  const now = Date.now();
+  const tombstones = loadDeletedIds();
 
   for (const p of local) {
     if (!p?.id) continue;
+    if (tombstones[p.id]) {
+      localWins = true;
+      continue;
+    }
     localIds.add(p.id);
     const r = remoteById.get(p.id);
     if (!r) {
-      merged.push(p);
-      localWins = true;
+      // Local-only: keep only if this looks like a brand-new create still syncing
+      const t = projectSyncTime(p);
+      if (t && now - t < MEMBERSHIP_GRACE_MS) {
+        merged.push(p);
+        localWins = true;
+      } else {
+        // Missing on cloud and not fresh → deleted elsewhere; don't resurrect
+        localWins = true;
+      }
       continue;
     }
     const lt = projectSyncTime(p);
@@ -251,7 +315,6 @@ function mergeProjectsBoard(local, remote) {
     } else if (lt < rt) {
       merged.push(r);
     } else {
-      // Equal time: prefer local (same-stage reorder often doesn't change activity)
       merged.push(p);
       if (p.stage !== r.stage || p.boardOrder !== r.boardOrder) localWins = true;
     }
@@ -259,6 +322,11 @@ function mergeProjectsBoard(local, remote) {
 
   for (const r of remote) {
     if (!r?.id || localIds.has(r.id)) continue;
+    if (tombstones[r.id]) {
+      localWins = true;
+      continue;
+    }
+    // Other clients' cards — always accept on read (write path won't resurrect deletes)
     merged.push(r);
   }
 
@@ -3750,6 +3818,9 @@ export default function StudioTracker() {
   const pushUndo = useCallback((snapshot, message) => {
     const undo = async () => {
       undoRef.current = null;
+      const ids = (snapshot || []).map(p => p?.id).filter(Boolean);
+      clearDeletedIds(ids);
+      for (const id of ids) suppressedRemoteIdsRef.current.delete(id);
       setProjects(snapshot);
       try {
         await save(snapshot);
@@ -3795,7 +3866,15 @@ export default function StudioTracker() {
         if (window.storage.migrate) await window.storage.migrate();
         const [p, s, l, sr] = await Promise.all([load(), loadSS(), loadLic(), loadSalesReq()]);
         if (!active) return;
-        setProjects(p);
+        const tombstones = loadDeletedIds();
+        const list = Array.isArray(p) ? p : [];
+        const cleaned = list.filter(x => !tombstones[x?.id]);
+        setProjects(cleaned);
+        projectsRef.current = cleaned;
+        // If this browser deleted cards that got re-saved by another tab, push clean board
+        if (cleaned.length < list.length) {
+          try { await save(cleaned); } catch (e) { console.warn(e); }
+        }
         setSets(s);
         setLicRequests(Array.isArray(l) ? l : []);
         setSalesRequests(Array.isArray(sr) ? sr : []);
@@ -3842,11 +3921,15 @@ export default function StudioTracker() {
             for (const id of [...suppressedRemoteIdsRef.current]) {
               if (!remoteIds.has(id)) suppressedRemoteIdsRef.current.delete(id);
             }
-            const filtered = merged.filter(p => !suppressedRemoteIdsRef.current.has(p?.id));
+            // Cloud confirmed delete — clear persistent tombstones
+            const gone = Object.keys(loadDeletedIds()).filter(id => !remoteIds.has(id));
+            if (gone.length) clearDeletedIds(gone);
+            const tombstones = loadDeletedIds();
+            const filtered = merged.filter(p => !suppressedRemoteIdsRef.current.has(p?.id) && !tombstones[p?.id]);
             const next = mergeProjectHighlights(filtered, prev);
             projectsRef.current = next;
-            // Only re-push if this client created cards the cloud doesn't have yet
-            const hasLocalCreates = prev.some(p => p?.id && !remoteIds.has(p.id));
+            // Re-push only brand-new local cards the cloud doesn't have yet
+            const hasLocalCreates = next.some(p => p?.id && !remoteIds.has(p.id));
             if (hasLocalCreates && Date.now() - lastLocalSaveAtRef.current < 60000) {
               queueMicrotask(() => saveProjectsRef.current?.(next));
             }
@@ -3889,10 +3972,13 @@ export default function StudioTracker() {
           for (const id of [...suppressedRemoteIdsRef.current]) {
             if (!remoteIds.has(id)) suppressedRemoteIdsRef.current.delete(id);
           }
-          const filtered = merged.filter(x => !suppressedRemoteIdsRef.current.has(x?.id));
+          const gone = Object.keys(loadDeletedIds()).filter(id => !remoteIds.has(id));
+          if (gone.length) clearDeletedIds(gone);
+          const tombstones = loadDeletedIds();
+          const filtered = merged.filter(x => !suppressedRemoteIdsRef.current.has(x?.id) && !tombstones[x?.id]);
           const next = mergeProjectHighlights(filtered, prev);
           projectsRef.current = next;
-          const hasLocalCreates = prev.some(x => x?.id && !remoteIds.has(x.id));
+          const hasLocalCreates = next.some(x => x?.id && !remoteIds.has(x.id));
           if (hasLocalCreates) queueMicrotask(() => saveProjectsRef.current?.(next));
           return next;
         });
@@ -3922,12 +4008,19 @@ export default function StudioTracker() {
     const undoSnapshot = typeof opts === "object" && opts?.undoSnapshot != null ? opts.undoSnapshot : null;
     const prevIds = new Set((projectsRef.current || []).map(p => p?.id).filter(Boolean));
     const nextIds = new Set((next || []).map(p => p?.id).filter(Boolean));
+    const removed = [];
     for (const id of prevIds) {
-      if (!nextIds.has(id)) suppressedRemoteIdsRef.current.add(id);
+      if (!nextIds.has(id)) {
+        suppressedRemoteIdsRef.current.add(id);
+        removed.push(id);
+      }
     }
     for (const id of nextIds) {
       suppressedRemoteIdsRef.current.delete(id);
     }
+    if (removed.length) rememberDeletedIds(removed);
+    // Undo / restore clears tombstones for IDs that are back
+    if (nextIds.size) clearDeletedIds([...nextIds]);
     projectsRef.current = next;
     setProjects(next);
     // Block remote apply immediately — not only after the queued save starts —
