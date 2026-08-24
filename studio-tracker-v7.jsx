@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from "rea
 import { UserButton } from "@clerk/clerk-react";
 import { useAppRole, useNickname } from "./src/useAppRole.js";
 import SalesPage, { computeOverview, computeWorkload } from "./src/SalesPage.jsx";
+import BusyWhale, { dismissBootSplash } from "./src/BusyWhale.jsx";
 
 const MAX_ACTIVITY = 50;
 
@@ -154,7 +155,8 @@ const assigneesLabel = (names) =>
 const normalizeProjectForSave = (p) => {
   const assignees = projectAssignees(p);
   const { assignee: _legacy, ...rest } = p;
-  return { ...rest, assignees };
+  const createdAt = rest.createdAt || projectCreatedAt(rest);
+  return { ...rest, assignees, ...(createdAt ? { createdAt } : {}) };
 };
 
 const DRAWER_MERGE_FIELDS = [
@@ -384,6 +386,37 @@ const fmt       = (d) => {
   const x = parseLocalDate(d);
   return x ? x.toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—";
 };
+const fmtCreated = (d) => {
+  const x = parseLocalDate(d);
+  if (!x) return "—";
+  return x.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: x.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
+  });
+};
+
+/** Best-effort created timestamp for older cards that never stored createdAt */
+function projectCreatedAt(p) {
+  if (!p) return "";
+  if (p.createdAt && parseLocalDate(p.createdAt)) return p.createdAt;
+  const createdAct = (p.activity || []).find(a => /created project/i.test(String(a?.text || "")));
+  if (createdAct?.at && parseLocalDate(createdAct.at)) return createdAct.at;
+  const oldest = (p.activity || []).reduce((best, a) => {
+    const t = Date.parse(a?.at || "") || 0;
+    if (!t) return best;
+    if (!best || t < best.t) return { t, at: a.at };
+    return best;
+  }, null);
+  if (oldest?.at) return oldest.at;
+  const m = String(p.id || "").match(/^p(\d{10,})$/);
+  if (m) {
+    const t = Number(m[1]);
+    if (t > 1e12 && t < 2e13) return new Date(t).toISOString();
+  }
+  return "";
+}
+
 const daysUntil = (d) => {
   const due = parseLocalDate(d);
   if (!due) return null;
@@ -693,6 +726,7 @@ function buildProjectFromSalesRequest(req, boardType, projects, actor, teamProfi
     activity: [],
     boardOrder: maxOrder + 1,
     salesRequestId: req.id,
+    createdAt: now,
     highlightAt: now,
     ...(assignees.length ? { assignHighlightAt: now, assignHighlightFor: assignees } : {}),
   };
@@ -919,6 +953,7 @@ function buildProductFromFollowUp(pres, followUp, projects, actor, teamProfile) 
     activity: [],
     boardOrder: maxOrder + 1,
     priority: "high",
+    createdAt: now,
     highlightAt: now,
     ...(assignees.length ? { assignHighlightAt: now, assignHighlightFor: assignees } : {}),
   };
@@ -1292,6 +1327,7 @@ function BoardCard({
   const pr       = priorityOf(project);
   const licenses = isWaitingOnLicenses(project);
   const salesHold = isWaitingOnSalesInfo(project) || isWaitingOnSalesProduct(project);
+  const createdAt = projectCreatedAt(project);
   // Keep cards quiet: priority first, then one other signal max
   const slimHints = (() => {
     const all = cardStatusHints(project);
@@ -1348,8 +1384,13 @@ function BoardCard({
             <AssigneeAvatars project={project} size="sm" maxShow={2} showUnassigned />
           </div>
           <div className="card-right">
+            {createdAt && (
+              <span className="card-created" title={`Created ${fmtCreated(createdAt)}`}>
+                {fmtCreated(createdAt)}
+              </span>
+            )}
             {project.dueDate && (
-              <span className={`card-due ${overdue ? "c-red" : dueSoon ? "c-amber" : ""}`}>
+              <span className={`card-due ${overdue ? "c-red" : dueSoon ? "c-amber" : ""}`} title="Due date">
                 {overdue ? `${Math.abs(days)}d late` : fmt(project.dueDate)}
               </span>
             )}
@@ -1715,8 +1756,11 @@ function ListView({ projects, onOpen, shouldGlowProject }) {
               <div className="list-assignee">
                 <AssigneeAvatars project={p} maxShow={2} showUnassigned />
               </div>
-              <div className={`list-due ${overdue ? "c-red" : ""}`}>
-                {p.dueDate ? (overdue ? `${Math.abs(days)}d late` : fmt(p.dueDate)) : "—"}
+              <div className="list-due-col">
+                <div className="list-created" title="Date created">{fmtCreated(projectCreatedAt(p))}</div>
+                <div className={`list-due ${overdue ? "c-red" : ""}`} title="Due date">
+                  {p.dueDate ? (overdue ? `${Math.abs(days)}d late` : fmt(p.dueDate)) : "—"}
+                </div>
               </div>
             </div>
           );
@@ -2243,7 +2287,12 @@ function Drawer({ project, isNew, onSave, onClose, onDelete, onMoveBoard, presen
               </Select>
             </Field>
 
-            <div className="drawer-core-grid">
+            <div className="drawer-core-grid drawer-core-grid--3">
+              <Field label="Created">
+                <div className="drawer-created-readout" title={projectCreatedAt(form) || undefined}>
+                  {fmtCreated(projectCreatedAt(form))}
+                </div>
+              </Field>
               <Field label="Start">
                 <Input type="date" value={form.startDate} onChange={e => set("startDate", e.target.value)} disabled={readOnly} />
               </Field>
@@ -3592,6 +3641,13 @@ export default function StudioTracker() {
   const saveProjectsRef = useRef(null);
   /** IDs removed locally until cloud confirms they're gone (blocks stale remote resurrect) */
   const suppressedRemoteIdsRef = useRef(new Set());
+  const [busyDepth, setBusyDepth] = useState(0);
+  const bumpBusy = useCallback(() => setBusyDepth(n => n + 1), []);
+  const dropBusy = useCallback(() => setBusyDepth(n => Math.max(0, n - 1)), []);
+  const trackBusy = useCallback((promise) => {
+    bumpBusy();
+    return Promise.resolve(promise).finally(dropBusy);
+  }, [bumpBusy, dropBusy]);
   const [sets,           setSets]           = useState([]);
   const [licRequests,    setLicRequests]    = useState([]);
   const [salesRequests,  setSalesRequests]  = useState([]);
@@ -3607,6 +3663,7 @@ export default function StudioTracker() {
   })();
   const [loading,        setLoading]        = useState(true);
   const pageKey = user?.id ? `st_page_${user.id}` : "st_page";
+  const boardModeKey = user?.id ? `st_board_mode_${user.id}` : "st_board_mode";
   const [page, setPage] = useState(() => {
     try {
       const v = localStorage.getItem(pageKey);
@@ -3622,7 +3679,15 @@ export default function StudioTracker() {
   const [boardTagFilter, setBoardTagFilter] = useState(null); // null | "priority" | "awaiting_sales" | "licenses" | "sales_info"
   const [search,         setSearch]         = useState("");
   const [view,           setView]           = useState("board");
-  const [boardMode,      setBoardMode]      = useState("products"); // "products" | "presentations"
+  const [boardMode,      setBoardMode]      = useState(() => {
+    try {
+      const v = localStorage.getItem(boardModeKey);
+      if (v === "products" || v === "presentations") return v;
+    } catch {
+      /* ignore */
+    }
+    return "products";
+  }); // "products" | "presentations"
   const [drawer,         setDrawer]         = useState(null);
   const [followUpModalOpen, setFollowUpModalOpen] = useState(false);
   const [projectHighlightSeen, setProjectHighlightSeen] = useState(() => loadProjectHighlightSeen(user?.id));
@@ -3738,6 +3803,8 @@ export default function StudioTracker() {
         console.error("Failed to load team data:", e);
         if (active) flash("Could not load team board — check Supabase settings");
       } finally {
+        if (!active) return;
+        await dismissBootSplash();
         if (active) setLoading(false);
       }
     })();
@@ -3866,6 +3933,7 @@ export default function StudioTracker() {
     // Block remote apply immediately — not only after the queued save starts —
     // so a poll can't resurrect a just-deleted card before the write begins.
     savingRef.current += 1;
+    bumpBusy();
 
     const run = async () => {
       let attempt = 0;
@@ -3893,13 +3961,14 @@ export default function StudioTracker() {
         }
       } finally {
         savingRef.current = Math.max(0, savingRef.current - 1);
+        dropBusy();
       }
     };
 
     const queued = saveChainRef.current.then(run, run);
     saveChainRef.current = queued.catch(() => {});
     return queued;
-  }, [pushUndo, flash]);
+  }, [pushUndo, flash, bumpBusy, dropBusy]);
   saveProjectsRef.current = saveProjects;
 
   const handleAssign = useCallback((id, name) => {
@@ -3955,6 +4024,7 @@ export default function StudioTracker() {
       category: categoryFilter !== "all" ? categoryFilter : "apparel",
       assignees, season: "SS26", dueDate: "", notes: "", styleNumbers: [], activity: [],
       boardOrder: maxOrder + 1,
+      createdAt: now,
       highlightAt: now,
       ...(assignees.length ? { assignHighlightAt: now, assignHighlightFor: assignees } : {}),
     };
@@ -3980,6 +4050,7 @@ export default function StudioTracker() {
     const now = new Date().toISOString();
     const highlightPatch = !exists
       ? {
+          createdAt: mergedForm.createdAt || now,
           highlightAt: now,
           ...(nextAs.length ? { assignHighlightAt: now, assignHighlightFor: nextAs } : {}),
         }
@@ -3989,6 +4060,7 @@ export default function StudioTracker() {
     const payload = normalizeProjectForSave({
       ...mergedForm,
       ...highlightPatch,
+      createdAt: mergedForm.createdAt || prev?.createdAt || (!exists ? now : projectCreatedAt(mergedForm)),
       styleNumbers: normalizeStyleEntries(mergedForm.styleNumbers),
     });
     const updated = withActivity(prev, payload, actor);
@@ -4127,6 +4199,14 @@ export default function StudioTracker() {
       /* ignore */
     }
   }, [pageKey, page]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(boardModeKey, boardMode);
+    } catch {
+      /* ignore */
+    }
+  }, [boardModeKey, boardMode]);
   const catPool = projects.filter(p => {
     const typeOk = boardMode === "presentations" ? p.projectType === "presentation" : p.projectType !== "presentation";
     const asnOk  = projectMatchesAssigneeFilter(p, assigneeFilter);
@@ -4178,7 +4258,8 @@ export default function StudioTracker() {
     setSets(prev => {
       const exists = prev.some(s => s.id === data.id);
       const next = exists ? prev.map(s => s.id === data.id ? data : s) : [data, ...prev];
-      saveSS(next); return next;
+      trackBusy(saveSS(next));
+      return next;
     });
   };
   const handleSDelete = (id) => {
@@ -4188,10 +4269,10 @@ export default function StudioTracker() {
     const snapshot = sets;
     const next = sets.filter(s => s.id !== id);
     setSets(next);
-    saveSS(next);
+    trackBusy(saveSS(next));
     showUndoToast(`Deleted “${removed.name}”`, () => {
       setSets(snapshot);
-      saveSS(snapshot);
+      trackBusy(saveSS(snapshot));
     });
   };
 
@@ -4214,7 +4295,7 @@ export default function StudioTracker() {
       };
       const base = withLicActivity(prevRow, payload, actor, projects);
       const next = exists ? prev.map(r => r.id === data.id ? base : r) : [base, ...prev];
-      saveLic(next);
+      trackBusy(saveLic(next));
       return next;
     });
   };
@@ -4236,7 +4317,7 @@ export default function StudioTracker() {
       };
       const row = withSalesReqActivity(prevRow, base, actor, projects);
       const next = exists ? prev.map(r => r.id === data.id ? row : r) : [row, ...prev];
-      saveSalesReq(next);
+      trackBusy(saveSalesReq(next));
       return next;
     });
     flash(isNew ? "Sales request submitted" : "Request saved");
@@ -4288,7 +4369,7 @@ export default function StudioTracker() {
     const row = withSalesReqActivity(prevRow, base, actor, nextProjects);
     const nextReqs = salesRequests.map(r => r.id === id ? row : r);
     setSalesRequests(nextReqs);
-    saveSalesReq(nextReqs);
+    trackBusy(saveSalesReq(nextReqs));
 
     if (status === "approved") {
       flash(createdProjectId && boardType
@@ -4317,10 +4398,10 @@ export default function StudioTracker() {
     const snapshot = salesRequests;
     const next = salesRequests.filter(r => r.id !== id);
     setSalesRequests(next);
-    saveSalesReq(next);
+    trackBusy(saveSalesReq(next));
     showUndoToast(`Deleted “${removed.title || "request"}”`, () => {
       setSalesRequests(snapshot);
-      saveSalesReq(snapshot);
+      trackBusy(saveSalesReq(snapshot));
     });
   };
 
@@ -4331,14 +4412,16 @@ export default function StudioTracker() {
     const snapshot = licRequests;
     const next = licRequests.filter(r => r.id !== id);
     setLicRequests(next);
-    saveLic(next);
+    trackBusy(saveLic(next));
     showUndoToast("Deleted licensing request", () => {
       setLicRequests(snapshot);
-      saveLic(snapshot);
+      trackBusy(saveLic(snapshot));
     });
   };
 
-  if (loading) return <div style={{ minHeight:"100vh", background:"#0C0C10", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"Open Sans,sans-serif", color:"#56566A" }}>Loading…</div>;
+  const whaleBusy = busyDepth > 0;
+
+  if (loading) return null;
 
   return (
     <div className="app">
@@ -5001,8 +5084,9 @@ export default function StudioTracker() {
         .assignee-pick-btn:hover:not(:disabled) { border-color: var(--tc); }
         .assignee-pick-btn:disabled { cursor: default; opacity: 0.85; }
         .card-name { font-size: 11px; color: #9494B0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .card-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
-        .card-due { font-size: 11px; color: #56566A; }
+        .card-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+        .card-created { font-size: 10px; color: #56566A; font-weight: 500; letter-spacing: 0.01em; }
+        .card-due { font-size: 11px; color: #9494B0; font-weight: 600; }
         .unsync-dot { width: 5px; height: 5px; border-radius: 50%; background: #FB923C; }
 
         /* ── QUICK ADD ── */
@@ -5043,7 +5127,9 @@ export default function StudioTracker() {
         .stage-dot { width: 6px; height: 6px; border-radius: 50%; }
         .list-assignee { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0 8px; }
         .list-name { font-size: 12px; color: #9494B0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .list-due { font-size: 12px; color: #56566A; padding-right: 16px; }
+        .list-due-col { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; padding-right: 16px; min-width: 72px; }
+        .list-created { font-size: 11px; color: #56566A; font-weight: 500; }
+        .list-due { font-size: 12px; color: #9494B0; font-weight: 600; padding-right: 0; }
         .list-empty { padding: 60px 40px; text-align: center; color: #3A3A50; font-size: 14px; }
 
         /* ── DRAWER ── */
@@ -5128,6 +5214,11 @@ export default function StudioTracker() {
         .drawer-essentials { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
         .drawer-core-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         .drawer-core-grid--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .drawer-created-readout {
+          min-height: 38px; display: flex; align-items: center;
+          padding: 0 12px; border-radius: 8px; border: 1px solid #2A2A36;
+          background: #1C1C24; color: #9494B0; font-size: 13px; font-weight: 600;
+        }
         .drawer-action-block { margin-bottom: 12px; }
         .drawer-section { border-top: 1px solid #2A2A36; }
         .drawer-section-toggle {
@@ -5793,7 +5884,7 @@ export default function StudioTracker() {
           .list-main { grid-column: 2; grid-row: 1; }
           .list-stage-pill { grid-column: 3; grid-row: 1; align-self: center; }
           .list-assignee { grid-column: 2; grid-row: 2; padding: 0 16px 12px 14px; }
-          .list-due { grid-column: 3; grid-row: 2; align-self: center; padding: 0 16px 12px 0; text-align: right; }
+          .list-due-col { grid-column: 3; grid-row: 2; align-self: center; padding: 0 16px 12px 0; }
           .drawer { top: auto; left: 0; right: 0; bottom: 0; max-width: 100%; border-left: none; border-top: 1px solid #2A2A36; border-top-left-radius: 18px; border-top-right-radius: 18px; max-height: 92vh; animation: slideInUp 0.28s ease-out; }
           .drawer.closing { animation: slideOutDown 0.18s ease-in forwards; }
           @keyframes slideOutDown { from { transform: translateY(0); } to { transform: translateY(100%); } }
@@ -6051,6 +6142,7 @@ export default function StudioTracker() {
           )}
         </div>
       )}
+      <BusyWhale busy={whaleBusy} />
     </div>
   );
 }
