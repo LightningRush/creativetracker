@@ -1,4 +1,6 @@
-import { SignedIn, SignedOut, SignIn } from "@clerk/clerk-react";
+import { SignedIn, SignedOut, SignIn, useAuth } from "@clerk/clerk-react";
+import { useEffect } from "react";
+import { dismissBootSplash } from "./BusyWhale.jsx";
 
 const clerkAppearance = {
   variables: {
@@ -34,6 +36,10 @@ const clerkAppearance = {
 };
 
 export function MissingAuthConfig() {
+  useEffect(() => {
+    dismissBootSplash();
+  }, []);
+
   return (
     <Wrapper style={shell}>
       <Icon style={mark}>◈</Icon>
@@ -54,6 +60,16 @@ export function MissingAuthConfig() {
 }
 
 export default function AuthGate({ children }) {
+  const { isLoaded, isSignedIn } = useAuth();
+
+  useEffect(() => {
+    // Signed-out: drop splash so the sign-in UI is visible
+    if (isLoaded && !isSignedIn) dismissBootSplash();
+  }, [isLoaded, isSignedIn]);
+
+  // Keep the HTML boot splash visible — don't remount a second React splash
+  if (!isLoaded) return null;
+
   return (
     <>
       <SignedOut>
