@@ -3821,6 +3821,7 @@ export default function StudioTracker() {
       const ids = (snapshot || []).map(p => p?.id).filter(Boolean);
       clearDeletedIds(ids);
       for (const id of ids) suppressedRemoteIdsRef.current.delete(id);
+      window.storage?.clearDeleted?.(ids)?.catch(() => {});
       setProjects(snapshot);
       try {
         await save(snapshot);
@@ -4018,9 +4019,19 @@ export default function StudioTracker() {
     for (const id of nextIds) {
       suppressedRemoteIdsRef.current.delete(id);
     }
-    if (removed.length) rememberDeletedIds(removed);
-    // Undo / restore clears tombstones for IDs that are back
-    if (nextIds.size) clearDeletedIds([...nextIds]);
+    if (removed.length) {
+      rememberDeletedIds(removed);
+      // Shared cloud tombstones — every client strips these on read/write
+      window.storage?.recordDeleted?.(removed)?.catch((e) => {
+        console.warn("[delete] could not record shared tombstones:", e?.message || e);
+      });
+    }
+    // Undo / restore clears local + shared tombstones for IDs that are back
+    if (nextIds.size) {
+      const restored = [...nextIds];
+      clearDeletedIds(restored);
+      window.storage?.clearDeleted?.(restored)?.catch(() => {});
+    }
     projectsRef.current = next;
     setProjects(next);
     // Block remote apply immediately — not only after the queued save starts —
@@ -4198,7 +4209,16 @@ export default function StudioTracker() {
     if (!removed) return;
     const next = projects.filter(p => p.id !== id);
     setDrawer(null);
-    saveProjects(next, { message: `Deleted “${removed.title}”`, undoSnapshot: projects });
+    // Record tombstone first so a concurrent save from another tab can't resurrect it
+    const finish = () => saveProjects(next, { message: `Deleted “${removed.title}”`, undoSnapshot: projects });
+    if (window.storage?.recordDeleted) {
+      window.storage.recordDeleted([id]).then(finish).catch((e) => {
+        console.warn(e);
+        finish();
+      });
+    } else {
+      finish();
+    }
   };
 
   const handleLogBuyerFollowUp = useCallback(({ presentationId, title, summary }) => {
