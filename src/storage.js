@@ -44,11 +44,29 @@ function parseDeletedMap(raw) {
   }
 }
 
+function tombstoneAt(entry) {
+  if (!entry) return 0;
+  if (typeof entry === "string") return Date.parse(entry) || 0;
+  if (typeof entry === "object") return Date.parse(entry.at || "") || 0;
+  return 0;
+}
+
+/** ID-only tombstones — title keys were unsafe (blocked intentional recreates / self-cleared on poll). */
+function isProjectTombstoned(p, deletedMap) {
+  if (!p?.id || !deletedMap) return !p?.id;
+  return !!deletedMap[p.id];
+}
+
 function pruneDeletedMap(map) {
   const cutoff = Date.now() - 90 * 86400000;
   const next = { ...map };
-  for (const [id, at] of Object.entries(next)) {
-    const t = Date.parse(at) || 0;
+  for (const [id, entry] of Object.entries(next)) {
+    // Drop legacy title:* keys from earlier builds
+    if (String(id).startsWith("title:")) {
+      delete next[id];
+      continue;
+    }
+    const t = tombstoneAt(entry);
     if (t && t < cutoff) delete next[id];
   }
   return next;
@@ -62,19 +80,19 @@ function pruneDeletedMap(map) {
 function mergeProjectLists(local, remote, deletedMap = {}) {
   if (!Array.isArray(local)) return Array.isArray(remote) ? remote : [];
   if (!Array.isArray(remote) || !remote.length) {
-    return local.filter((p) => p?.id && !deletedMap[p.id]);
+    return local.filter((p) => p?.id && !isProjectTombstoned(p, deletedMap));
   }
 
   const remoteById = new Map();
   for (const p of remote) {
-    if (p?.id && !deletedMap[p.id]) remoteById.set(p.id, p);
+    if (p?.id && !isProjectTombstoned(p, deletedMap)) remoteById.set(p.id, p);
   }
 
   const localIds = new Set();
   const merged = [];
 
   for (const p of local) {
-    if (!p?.id || deletedMap[p.id]) continue;
+    if (!p?.id || isProjectTombstoned(p, deletedMap)) continue;
     localIds.add(p.id);
     const r = remoteById.get(p.id);
     if (!r) {
@@ -94,7 +112,7 @@ function mergeProjectLists(local, remote, deletedMap = {}) {
 
   const now = Date.now();
   for (const r of remote) {
-    if (!r?.id || localIds.has(r.id) || deletedMap[r.id]) continue;
+    if (!r?.id || localIds.has(r.id) || isProjectTombstoned(r, deletedMap)) continue;
     const t = projectTime(r);
     if (t && now - t < REMOTE_CREATE_GRACE_MS) merged.push(r);
   }
@@ -107,7 +125,7 @@ function stripDeletedFromProjectsJson(str, deletedMap) {
   try {
     const arr = JSON.parse(str);
     if (!Array.isArray(arr)) return { str, changed: false };
-    const cleaned = arr.filter((p) => p?.id && !deletedMap[p.id]);
+    const cleaned = arr.filter((p) => p?.id && !isProjectTombstoned(p, deletedMap));
     if (cleaned.length === arr.length) return { str, changed: false };
     return { str: JSON.stringify(cleaned), changed: true };
   } catch {
@@ -205,12 +223,16 @@ function createSupabaseStorage(url, anonKey) {
   }
 
   /** Record permanently deleted project IDs (shared across the team). */
-  async function recordDeleted(ids) {
-    const list = (ids || []).filter(Boolean);
+  async function recordDeleted(entries) {
+    const list = (entries || []).filter(Boolean);
     if (!list.length) return;
     const map = await readDeletedMap({ bypassCache: true });
     const now = new Date().toISOString();
-    for (const id of list) map[id] = now;
+    for (const entry of list) {
+      const id = typeof entry === "string" ? entry : entry?.id;
+      if (!id || String(id).startsWith("title:")) continue;
+      map[id] = now;
+    }
     await writeDeletedMap(map);
   }
 
@@ -397,7 +419,7 @@ function createSupabaseStorage(url, anonKey) {
 
     const applyIfChanged = (row) => {
       if (row?.value == null || row.value === last) return;
-      if (row.source === "local-pending" || row.source === "local-newer") {
+      if (row.source === "local-pending") {
         last = row.value;
         return;
       }
