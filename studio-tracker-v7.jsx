@@ -207,12 +207,19 @@ function mergeDrawerOntoCurrent(current, form, base) {
 /** Best-effort "how fresh is this project" for sync merges */
 function projectSyncTime(p) {
   if (!p) return 0;
-  return Math.max(
+  let t = Math.max(
     Date.parse(p.updatedAt || "") || 0,
-    Date.parse(p.activity?.[0]?.at || "") || 0,
     Date.parse(p.assignHighlightAt || "") || 0,
     Date.parse(p.highlightAt || "") || 0,
   );
+  const act = p.activity;
+  if (Array.isArray(act)) {
+    for (const a of act) {
+      const at = Date.parse(a?.at || a?.time || a?.when || "") || 0;
+      if (at > t) t = at;
+    }
+  }
+  return t;
 }
 
 /** How long a brand-new card can exist on only one client before sync treats it as intentional */
@@ -237,20 +244,32 @@ function saveDeletedIds(map) {
   }
 }
 
-function rememberDeletedIds(ids) {
-  if (!ids?.length) return;
+function rememberDeletedIds(entries) {
+  if (!entries?.length) return;
   const map = loadDeletedIds();
   const now = new Date().toISOString();
-  for (const id of ids) {
-    if (id) map[id] = now;
+  for (const entry of entries) {
+    if (!entry) continue;
+    const id = typeof entry === "string" ? entry : entry?.id;
+    if (!id || String(id).startsWith("title:")) continue;
+    map[id] = now;
   }
-  // Drop tombstones older than 30 days
+  // Drop legacy title:* keys and old tombstones
   const cutoff = Date.now() - 30 * 86400000;
   for (const [id, at] of Object.entries(map)) {
-    const t = Date.parse(at) || 0;
+    if (String(id).startsWith("title:")) {
+      delete map[id];
+      continue;
+    }
+    const t = Date.parse(typeof at === "string" ? at : at?.at || "") || 0;
     if (t && t < cutoff) delete map[id];
   }
   saveDeletedIds(map);
+}
+
+function isLocallyTombstoned(p, tombstones) {
+  if (!p?.id || !tombstones) return !p?.id;
+  return !!tombstones[p.id];
 }
 
 function clearDeletedIds(ids) {
@@ -273,15 +292,14 @@ function clearDeletedIds(ids) {
  * another tab/device actually sticks instead of being re-saved forever.
  */
 function mergeProjectsBoard(local, remote) {
-  if (!Array.isArray(remote)) return { merged: Array.isArray(local) ? local : [], localWins: false };
-  if (!Array.isArray(local) || !local.length) return { merged: remote, localWins: false };
+  if (!Array.isArray(remote)) return Array.isArray(local) ? local : [];
+  if (!Array.isArray(local) || !local.length) return remote;
 
   const remoteById = new Map();
   for (const p of remote) {
     if (p?.id) remoteById.set(p.id, p);
   }
 
-  let localWins = false;
   const localIds = new Set();
   const merged = [];
   const now = Date.now();
@@ -289,48 +307,29 @@ function mergeProjectsBoard(local, remote) {
 
   for (const p of local) {
     if (!p?.id) continue;
-    if (tombstones[p.id]) {
-      localWins = true;
-      continue;
-    }
+    if (isLocallyTombstoned(p, tombstones)) continue;
     localIds.add(p.id);
     const r = remoteById.get(p.id);
     if (!r) {
       // Local-only: keep only if this looks like a brand-new create still syncing
       const t = projectSyncTime(p);
-      if (t && now - t < MEMBERSHIP_GRACE_MS) {
-        merged.push(p);
-        localWins = true;
-      } else {
-        // Missing on cloud and not fresh → deleted elsewhere; don't resurrect
-        localWins = true;
-      }
+      if (t && now - t < MEMBERSHIP_GRACE_MS) merged.push(p);
       continue;
     }
     const lt = projectSyncTime(p);
     const rt = projectSyncTime(r);
-    if (lt > rt) {
-      merged.push(p);
-      localWins = true;
-    } else if (lt < rt) {
-      merged.push(r);
-    } else {
-      merged.push(p);
-      if (p.stage !== r.stage || p.boardOrder !== r.boardOrder) localWins = true;
-    }
+    if (lt > rt) merged.push(p);
+    else if (lt < rt) merged.push(r);
+    else merged.push(p);
   }
 
   for (const r of remote) {
     if (!r?.id || localIds.has(r.id)) continue;
-    if (tombstones[r.id]) {
-      localWins = true;
-      continue;
-    }
-    // Other clients' cards — always accept on read (write path won't resurrect deletes)
+    if (isLocallyTombstoned(r, tombstones)) continue;
     merged.push(r);
   }
 
-  return { merged, localWins };
+  return merged;
 }
 
 const PROJ_HIGHLIGHT_SEEN_PREFIX = "st_proj_highlight_seen_";
@@ -814,6 +813,16 @@ function upsertProjectForSalesRequest(req, boardType, projects, actor, teamProfi
   let proj = projectId ? projects.find(p => p.id === projectId) : null;
 
   if (!proj) {
+    // Linked card was deleted — do NOT auto-recreate (that resurrected "GT Mens" etc.)
+    if (projectId) {
+      return {
+        nextProjects: projects,
+        projectId: "",
+        created: false,
+        title: req.title || "",
+        clearedLink: true,
+      };
+    }
     const created = buildProjectFromSalesRequest(req, boardType, projects, actor, teamProfile);
     return { nextProjects: [...projects, created], projectId: created.id, created: true, title: created.title };
   }
@@ -3298,6 +3307,11 @@ function SalesRequestDrawer({
                         )}
                       </div>
                     )}
+                    {!createdProject && form.createdProjectId && (
+                      <div className="field-hint" style={{ marginTop: 8 }}>
+                        Linked board card was deleted. Only add again if you really want a new card.
+                      </div>
+                    )}
                   </Field>
                 )}
 
@@ -3330,7 +3344,11 @@ function SalesRequestDrawer({
                     <div className="drawer-action-pair drawer-action-pair--single">
                       <button type="button" className="btn-primary btn-approve"
                         onClick={handleApprove}>
-                        {createdProject ? "Update board placement" : "Add to board"}
+                        {createdProject
+                          ? "Update board placement"
+                          : form.createdProjectId
+                            ? "Recreate board card"
+                            : "Add to board"}
                       </button>
                     </div>
                   )}
@@ -3822,9 +3840,11 @@ export default function StudioTracker() {
       clearDeletedIds(ids);
       for (const id of ids) suppressedRemoteIdsRef.current.delete(id);
       window.storage?.clearDeleted?.(ids)?.catch(() => {});
+      projectsRef.current = snapshot;
       setProjects(snapshot);
       try {
         await save(snapshot);
+        lastLocalSaveAtRef.current = Date.now();
         flash("Undone");
       } catch (e) {
         console.error(e);
@@ -3867,9 +3887,8 @@ export default function StudioTracker() {
         if (window.storage.migrate) await window.storage.migrate();
         const [p, s, l, sr] = await Promise.all([load(), loadSS(), loadLic(), loadSalesReq()]);
         if (!active) return;
-        const tombstones = loadDeletedIds();
         const list = Array.isArray(p) ? p : [];
-        const cleaned = list.filter(x => !tombstones[x?.id]);
+        const cleaned = list.filter(x => !isLocallyTombstoned(x, loadDeletedIds()));
         setProjects(cleaned);
         projectsRef.current = cleaned;
         // If this browser deleted cards that got re-saved by another tab, push clean board
@@ -3916,17 +3935,19 @@ export default function StudioTracker() {
         if (normalize && Array.isArray(data)) {
           data = data.map(normalizeProjectForSave);
           setProjects(prev => {
-            const { merged } = mergeProjectsBoard(prev, data);
+            const merged = mergeProjectsBoard(prev, data);
             const remoteIds = new Set(data.map(p => p?.id).filter(Boolean));
             // Drop IDs we deleted locally until cloud no longer has them
             for (const id of [...suppressedRemoteIdsRef.current]) {
               if (!remoteIds.has(id)) suppressedRemoteIdsRef.current.delete(id);
             }
-            // Cloud confirmed delete — clear persistent tombstones
-            const gone = Object.keys(loadDeletedIds()).filter(id => !remoteIds.has(id));
+            // Cloud confirmed delete — clear ID tombstones only (never title:* leftovers)
+            const gone = Object.keys(loadDeletedIds()).filter(
+              id => !String(id).startsWith("title:") && !remoteIds.has(id)
+            );
             if (gone.length) clearDeletedIds(gone);
             const tombstones = loadDeletedIds();
-            const filtered = merged.filter(p => !suppressedRemoteIdsRef.current.has(p?.id) && !tombstones[p?.id]);
+            const filtered = merged.filter(p => !suppressedRemoteIdsRef.current.has(p?.id) && !isLocallyTombstoned(p, tombstones));
             const next = mergeProjectHighlights(filtered, prev);
             projectsRef.current = next;
             // Re-push only brand-new local cards the cloud doesn't have yet
@@ -3968,15 +3989,17 @@ export default function StudioTracker() {
         if (savingRef.current > 0) return;
         setProjects(prev => {
           const remote = Array.isArray(p) ? p : [];
-          const { merged } = mergeProjectsBoard(prev, remote);
+          const merged = mergeProjectsBoard(prev, remote);
           const remoteIds = new Set(remote.map(x => x?.id).filter(Boolean));
           for (const id of [...suppressedRemoteIdsRef.current]) {
             if (!remoteIds.has(id)) suppressedRemoteIdsRef.current.delete(id);
           }
-          const gone = Object.keys(loadDeletedIds()).filter(id => !remoteIds.has(id));
+          const gone = Object.keys(loadDeletedIds()).filter(
+            id => !String(id).startsWith("title:") && !remoteIds.has(id)
+          );
           if (gone.length) clearDeletedIds(gone);
           const tombstones = loadDeletedIds();
-          const filtered = merged.filter(x => !suppressedRemoteIdsRef.current.has(x?.id) && !tombstones[x?.id]);
+          const filtered = merged.filter(x => !suppressedRemoteIdsRef.current.has(x?.id) && !isLocallyTombstoned(x, tombstones));
           const next = mergeProjectHighlights(filtered, prev);
           projectsRef.current = next;
           const hasLocalCreates = next.some(x => x?.id && !remoteIds.has(x.id));
@@ -3990,9 +4013,10 @@ export default function StudioTracker() {
     };
 
     window.addEventListener("focus", reloadFromCloud);
-    document.addEventListener("visibilitychange", () => {
+    const onVisible = () => {
       if (document.visibilityState === "visible") reloadFromCloud();
-    });
+    };
+    document.addEventListener("visibilitychange", onVisible);
 
     return () => {
       active = false;
@@ -4001,6 +4025,7 @@ export default function StudioTracker() {
       unsubLic();
       unsubSalesReq();
       window.removeEventListener("focus", reloadFromCloud);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
 
@@ -4021,16 +4046,15 @@ export default function StudioTracker() {
     }
     if (removed.length) {
       rememberDeletedIds(removed);
-      // Shared cloud tombstones — every client strips these on read/write
-      window.storage?.recordDeleted?.(removed)?.catch((e) => {
-        console.warn("[delete] could not record shared tombstones:", e?.message || e);
-      });
     }
-    // Undo / restore clears local + shared tombstones for IDs that are back
-    if (nextIds.size) {
-      const restored = [...nextIds];
-      clearDeletedIds(restored);
-      window.storage?.clearDeleted?.(restored)?.catch(() => {});
+    // Only clear tombstones for IDs that were deleted and are now being restored (undo)
+    if (removed.length === 0) {
+      const localTombs = loadDeletedIds();
+      const restored = [...nextIds].filter(id => localTombs[id]);
+      if (restored.length) {
+        clearDeletedIds(restored);
+        window.storage?.clearDeleted?.(restored)?.catch(() => {});
+      }
     }
     projectsRef.current = next;
     setProjects(next);
@@ -4042,6 +4066,13 @@ export default function StudioTracker() {
     const run = async () => {
       let attempt = 0;
       try {
+        if (removed.length && window.storage?.recordDeleted) {
+          try {
+            await window.storage.recordDeleted(removed);
+          } catch (e) {
+            console.warn("[delete] could not record shared tombstones:", e?.message || e);
+          }
+        }
         while (true) {
           // Always persist the latest board — not a stale snapshot from when this save was queued
           const payload = projectsRef.current;
@@ -4205,20 +4236,29 @@ export default function StudioTracker() {
   };
   const handleDelete = (id) => {
     if (!canEditProjects) return;
-    const removed = projects.find(p => p.id === id);
+    const list = projectsRef.current;
+    const removed = list.find(p => p.id === id);
     if (!removed) return;
-    const next = projects.filter(p => p.id !== id);
-    setDrawer(null);
-    // Record tombstone first so a concurrent save from another tab can't resurrect it
-    const finish = () => saveProjects(next, { message: `Deleted “${removed.title}”`, undoSnapshot: projects });
-    if (window.storage?.recordDeleted) {
-      window.storage.recordDeleted([id]).then(finish).catch((e) => {
-        console.warn(e);
-        finish();
-      });
-    } else {
-      finish();
+    const next = list.filter(p => p.id !== id);
+    // Clear sales-request links so "Add to board" doesn't recreate this card
+    let salesChanged = false;
+    const nextSales = (salesRequests || []).map(r => {
+      if (r.createdProjectId !== id) return r;
+      salesChanged = true;
+      return {
+        ...r,
+        createdProjectId: "",
+        createdBoardType: "",
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    if (salesChanged) {
+      setSalesRequests(nextSales);
+      trackBusy(saveSalesReq(nextSales));
     }
+    setDrawer(null);
+    // Tombstones + cloud write happen inside saveProjects
+    saveProjects(next, { message: `Deleted “${removed.title}”`, undoSnapshot: list });
   };
 
   const handleLogBuyerFollowUp = useCallback(({ presentationId, title, summary }) => {
@@ -4442,31 +4482,37 @@ export default function StudioTracker() {
     const prevRow = salesRequests.find(r => r.id === id);
     if (!prevRow) return;
 
-    let nextProjects = projects;
+    const boardSnapshot = projectsRef.current;
+    let nextProjects = boardSnapshot;
     let createdProjectId = prevRow.createdProjectId;
     let createdBoardType = prevRow.createdBoardType;
+    let boardSaveMessage = "";
 
     if (status === "approved" && boardType) {
       const upsert = upsertProjectForSalesRequest(
         { ...prevRow, reviewNote: reviewNote ?? prevRow.reviewNote ?? "" },
         boardType,
-        projects,
+        boardSnapshot,
         actor,
         boardProfile,
       );
       nextProjects = upsert.nextProjects;
       createdProjectId = upsert.projectId;
-      createdBoardType = boardType;
-      const boardLabel = boardTypeLabel(boardType);
-      saveProjects(nextProjects, {
-        message: upsert.created
+      createdBoardType = upsert.clearedLink ? "" : boardType;
+      if (upsert.clearedLink) {
+        flash("That board card was deleted — link cleared. Only click Add to board if you want a new one.");
+      } else {
+        const boardLabel = boardTypeLabel(boardType);
+        boardSaveMessage = upsert.created
           ? `Added “${upsert.title}” to ${boardLabel}`
           : upsert.moved
             ? `Moved “${upsert.title}” to ${boardLabel}`
-            : `Linked to ${boardLabel}`,
-        undoSnapshot: projects,
-      });
-      setProjects(nextProjects);
+            : `Linked to ${boardLabel}`;
+        saveProjects(nextProjects, {
+          message: boardSaveMessage,
+          undoSnapshot: boardSnapshot,
+        });
+      }
     }
 
     const base = {
@@ -4484,12 +4530,10 @@ export default function StudioTracker() {
     setSalesRequests(nextReqs);
     trackBusy(saveSalesReq(nextReqs));
 
-    if (status === "approved") {
-      flash(createdProjectId && boardType
-        ? `Approved — on ${boardTypeLabel(boardType)} board`
-        : "Request approved");
-    } else {
-      flash("Request rejected");
+    // Don't flash over the undo toast from saveProjects
+    if (!boardSaveMessage) {
+      if (status === "approved") flash("Request approved");
+      else flash("Request rejected");
     }
   };
 
