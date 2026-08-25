@@ -2,9 +2,14 @@ import { createClient } from "@supabase/supabase-js";
 
 const PROJECTS_KEY = "st_v10";
 const SELECT_SETS_KEY = "ss_v1";
+/** Shared delete tombstones — all clients must honor these on read/write */
+const DELETED_KEY = "st_v10_deleted";
 
 /** Prefer a recent local write while the cloud write may still be in flight */
 const LOCAL_WRITE_GRACE_MS = 15000;
+
+/** Concurrent creates from another tab still in flight (ms) */
+const REMOTE_CREATE_GRACE_MS = 90000;
 
 function asStoredString(value) {
   if (value == null) return null;
@@ -29,59 +34,47 @@ function projectTime(p) {
   return t;
 }
 
-/** How "new" a stored board blob is (max project time + count) */
-function boardScore(raw) {
+function parseDeletedMap(raw) {
   try {
-    const data = JSON.parse(raw);
-    if (!Array.isArray(data)) {
-      return { max: 0, count: 0, len: String(raw || "").length };
-    }
-    let max = 0;
-    for (const p of data) {
-      const t = projectTime(p);
-      if (t > max) max = t;
-    }
-    return { max, count: data.length, len: String(raw).length };
+    const v = JSON.parse(raw || "{}");
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    return v;
   } catch {
-    return { max: 0, count: 0, len: String(raw || "").length };
+    return {};
   }
 }
 
-function isFresher(candidate, baseline) {
-  if (!candidate) return false;
-  if (!baseline) return true;
-  if (candidate === baseline) return false;
-  const a = boardScore(candidate);
-  const b = boardScore(baseline);
-  if (a.max !== b.max) return a.max > b.max;
-  if (a.count !== b.count) return a.count > b.count;
-  return a.len > b.len;
+function pruneDeletedMap(map) {
+  const cutoff = Date.now() - 90 * 86400000;
+  const next = { ...map };
+  for (const [id, at] of Object.entries(next)) {
+    const t = Date.parse(at) || 0;
+    if (t && t < cutoff) delete next[id];
+  }
+  return next;
 }
-
-/** Concurrent creates from another tab still in flight (ms) */
-const REMOTE_CREATE_GRACE_MS = 90000;
 
 /**
  * Write-path merge: local board is authoritative for membership + order.
- * Remote-only IDs are NOT kept (that resurrected deletes). Only very fresh
- * remote-only cards are pulled in (concurrent create from another client).
- * For shared IDs, newer content wins but local stage/boardOrder always stick
- * — this write is an intentional board mutation.
+ * Never keep remote-only IDs that are tombstoned. Only very fresh remote-only
+ * cards are pulled in (concurrent create from another client).
  */
-function mergeProjectLists(local, remote) {
+function mergeProjectLists(local, remote, deletedMap = {}) {
   if (!Array.isArray(local)) return Array.isArray(remote) ? remote : [];
-  if (!Array.isArray(remote) || !remote.length) return local;
+  if (!Array.isArray(remote) || !remote.length) {
+    return local.filter((p) => p?.id && !deletedMap[p.id]);
+  }
 
   const remoteById = new Map();
   for (const p of remote) {
-    if (p?.id) remoteById.set(p.id, p);
+    if (p?.id && !deletedMap[p.id]) remoteById.set(p.id, p);
   }
 
   const localIds = new Set();
   const merged = [];
 
   for (const p of local) {
-    if (!p?.id) continue;
+    if (!p?.id || deletedMap[p.id]) continue;
     localIds.add(p.id);
     const r = remoteById.get(p.id);
     if (!r) {
@@ -91,7 +84,6 @@ function mergeProjectLists(local, remote) {
     if (projectTime(p) >= projectTime(r)) {
       merged.push(p);
     } else {
-      // Remote has newer field edits; keep this client's column placement
       merged.push({
         ...r,
         stage: p.stage,
@@ -102,12 +94,25 @@ function mergeProjectLists(local, remote) {
 
   const now = Date.now();
   for (const r of remote) {
-    if (!r?.id || localIds.has(r.id)) continue;
+    if (!r?.id || localIds.has(r.id) || deletedMap[r.id]) continue;
     const t = projectTime(r);
     if (t && now - t < REMOTE_CREATE_GRACE_MS) merged.push(r);
   }
 
   return merged;
+}
+
+function stripDeletedFromProjectsJson(str, deletedMap) {
+  if (!str || !deletedMap || !Object.keys(deletedMap).length) return { str, changed: false };
+  try {
+    const arr = JSON.parse(str);
+    if (!Array.isArray(arr)) return { str, changed: false };
+    const cleaned = arr.filter((p) => p?.id && !deletedMap[p.id]);
+    if (cleaned.length === arr.length) return { str, changed: false };
+    return { str: JSON.stringify(cleaned), changed: true };
+  } catch {
+    return { str, changed: false };
+  }
 }
 
 function createLocalStorage() {
@@ -119,6 +124,8 @@ function createLocalStorage() {
     async set(key, value) {
       localStorage.setItem(key, value);
     },
+    async recordDeleted() {},
+    async clearDeleted() {},
     subscribe() {
       return () => {};
     },
@@ -136,11 +143,90 @@ function createSupabaseStorage(url, anonKey) {
   /** Latest value we intentionally wrote — keeps polls from clobbering mid-save */
   const lastLocalWrite = Object.create(null);
   let healChain = Promise.resolve();
+  let deletedCache = { map: null, at: 0 };
 
   function scheduleHeal(key, value) {
     healChain = healChain
       .then(() => set(key, value))
       .catch((e) => console.error("[storage] heal push failed:", e?.message || e));
+  }
+
+  async function readDeletedMap({ bypassCache = false } = {}) {
+    if (!bypassCache && deletedCache.map && Date.now() - deletedCache.at < 5000) {
+      return deletedCache.map;
+    }
+    try {
+      const { data } = await supabase
+        .from(TABLE)
+        .select("value")
+        .eq("key", DELETED_KEY)
+        .maybeSingle();
+      const map = pruneDeletedMap(parseDeletedMap(asStoredString(data?.value)));
+      deletedCache = { map, at: Date.now() };
+      return map;
+    } catch (e) {
+      console.warn("[storage] deleted map read failed:", e?.message || e);
+      return deletedCache.map || {};
+    }
+  }
+
+  async function writeDeletedMap(map) {
+    const cleaned = pruneDeletedMap(map);
+    const str = JSON.stringify(cleaned);
+    const updated_at = new Date().toISOString();
+    deletedCache = { map: cleaned, at: Date.now() };
+
+    const { data: existing, error: existErr } = await supabase
+      .from(TABLE)
+      .select("key")
+      .eq("key", DELETED_KEY)
+      .maybeSingle();
+    if (existErr) throw existErr;
+
+    if (existing?.key) {
+      const { data, error } = await supabase
+        .from(TABLE)
+        .update({ value: str, updated_at })
+        .eq("key", DELETED_KEY)
+        .select("key")
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) throw new Error("Could not save delete list (RLS blocked UPDATE)");
+    } else {
+      const { data, error } = await supabase
+        .from(TABLE)
+        .insert({ key: DELETED_KEY, value: str, updated_at })
+        .select("key")
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) throw new Error("Could not save delete list (RLS blocked INSERT)");
+    }
+    return cleaned;
+  }
+
+  /** Record permanently deleted project IDs (shared across the team). */
+  async function recordDeleted(ids) {
+    const list = (ids || []).filter(Boolean);
+    if (!list.length) return;
+    const map = await readDeletedMap({ bypassCache: true });
+    const now = new Date().toISOString();
+    for (const id of list) map[id] = now;
+    await writeDeletedMap(map);
+  }
+
+  /** Undo a delete — allow these IDs back onto the board. */
+  async function clearDeleted(ids) {
+    const list = (ids || []).filter(Boolean);
+    if (!list.length) return;
+    const map = await readDeletedMap({ bypassCache: true });
+    let changed = false;
+    for (const id of list) {
+      if (map[id]) {
+        delete map[id];
+        changed = true;
+      }
+    }
+    if (changed) await writeDeletedMap(map);
   }
 
   async function get(key) {
@@ -164,7 +250,18 @@ function createSupabaseStorage(url, anonKey) {
       Date.now() - pending.at < LOCAL_WRITE_GRACE_MS &&
       pending.value;
 
-    const remoteValue = asStoredString(data?.value);
+    let remoteValue = asStoredString(data?.value);
+
+    // Strip tombstoned cards from the board whenever we read it
+    if (key === PROJECTS_KEY && remoteValue) {
+      const deletedMap = await readDeletedMap();
+      const stripped = stripDeletedFromProjectsJson(remoteValue, deletedMap);
+      if (stripped.changed) {
+        remoteValue = stripped.str;
+        // Permanently clean cloud so resurrected deletes don't linger
+        scheduleHeal(key, remoteValue);
+      }
+    }
 
     if (remoteValue) {
       if (pendingFresh && remoteValue !== pending.value) {
@@ -206,6 +303,13 @@ function createSupabaseStorage(url, anonKey) {
       }
     }
 
+    let deletedMap = {};
+    if (key === PROJECTS_KEY) {
+      deletedMap = await readDeletedMap();
+      const stripped = stripDeletedFromProjectsJson(str, deletedMap);
+      str = stripped.str;
+    }
+
     // Merge with current cloud so a stale tab cannot wipe newer projects
     if (key === PROJECTS_KEY || key === SELECT_SETS_KEY) {
       try {
@@ -219,12 +323,19 @@ function createSupabaseStorage(url, anonKey) {
           const localArr = JSON.parse(str);
           const remoteArr = JSON.parse(remoteStr);
           if (Array.isArray(localArr) && Array.isArray(remoteArr)) {
-            str = JSON.stringify(mergeProjectLists(localArr, remoteArr));
+            str = JSON.stringify(
+              mergeProjectLists(localArr, remoteArr, key === PROJECTS_KEY ? deletedMap : {})
+            );
           }
         }
       } catch (e) {
         console.warn("[storage] merge-before-write skipped:", e?.message || e);
       }
+    }
+
+    // Final strip after merge (remote-only fresh creates aren't tombstoned)
+    if (key === PROJECTS_KEY) {
+      str = stripDeletedFromProjectsJson(str, deletedMap).str;
     }
 
     const updated_at = new Date().toISOString();
@@ -243,7 +354,6 @@ function createSupabaseStorage(url, anonKey) {
     }
 
     if (existing?.key) {
-      // .select() after update: if RLS blocks, data is null with no error
       const { data: updated, error } = await supabase
         .from(TABLE)
         .update({ value: str, updated_at })
@@ -337,6 +447,11 @@ function createSupabaseStorage(url, anonKey) {
     };
   }
 
+  /**
+   * Only seed an EMPTY cloud from localStorage.
+   * Never overwrite existing team data — that resurrected deleted cards
+   * whenever a stale browser had a fatter board cached.
+   */
   async function migrate() {
     for (const key of KEYS) {
       try {
@@ -350,7 +465,7 @@ function createSupabaseStorage(url, anonKey) {
           .maybeSingle();
         const remoteStr = asStoredString(data?.value);
         const remoteEmpty = !remoteStr || remoteStr === "[]";
-        if (!remoteEmpty && !isFresher(local, remoteStr)) continue;
+        if (!remoteEmpty) continue;
 
         await set(key, local);
       } catch (e) {
@@ -359,7 +474,15 @@ function createSupabaseStorage(url, anonKey) {
     }
   }
 
-  return { get, set, subscribe, migrate, mode: "shared" };
+  return {
+    get,
+    set,
+    subscribe,
+    migrate,
+    recordDeleted,
+    clearDeleted,
+    mode: "shared",
+  };
 }
 
 export function initStorage() {
@@ -378,4 +501,4 @@ export function initStorage() {
   return storage;
 }
 
-export { PROJECTS_KEY, SELECT_SETS_KEY };
+export { PROJECTS_KEY, SELECT_SETS_KEY, DELETED_KEY };
